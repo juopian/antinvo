@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+ <title>Antinvo RPA</title>
+ <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="toolbar" style="display: flex; align-items: center;">
+    <button class="primary" onclick="create()">➕ 新建浏览器</button>
+    <button onclick="openDslModal()">⚙️ DSL 管理</button>
+    <div style="margin-left: auto; font-size: 14px; font-weight: bold;">
+      <span>浏览器总数: <span id="totalCount">0</span></span>
+      <span style="margin: 0 10px; color: #ccc;">|</span>
+      <span>运行中: <span id="runningCount" style="color: orange;">0</span></span>
+    </div>
+  </div>
+
+  <div id="list"></div>
+
+  <!-- DSL 模态框 -->
+  <div class="modal-overlay" id="dslModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>⚙️ DSL 脚本管理</h2>
+        <button class="close-modal" onclick="closeDslModal()">✖</button>
+      </div>
+      <div class="modal-body">
+        <div class="dsl-sidebar">
+           <button class="btn-new" onclick="createNewDsl()">➕ 新建脚本</button>
+           <div id="dslList"></div>
+        </div>
+        <div class="dsl-main">
+           <input type="hidden" id="editDslId" value="0">
+           <input type="text" id="editDslName" placeholder="输入 DSL 脚本名称">
+           <div id="editDslContent" style="flex: 1; min-height: 0; width: 100%; border: 1px solid #ccc; border-radius: 4px; margin: 10px 0;"></div>
+           <div class="dsl-actions">
+             <button class="btn-format" onclick="formatJson()">✨ 格式化</button>
+             <button class="btn-del" id="btnDelDsl" onclick="deleteCurrentDsl()" style="display:none;">删除</button>
+             <button class="btn-save" onclick="saveCurrentDsl()">保存修改</button>
+           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 引入 Ace Editor 以提供良好的 JSON 编辑体验 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.js"></script>
+  <script>
+    let globalDSLs = [];
+    let dslEditor;
+
+    // 更新顶部导航栏的浏览器统计状态
+    function updateStats() {
+      const total = document.querySelectorAll('.session-card').length;
+      const running = document.querySelectorAll('.session-card.running').length;
+      const totalEl = document.getElementById('totalCount');
+      const runningEl = document.getElementById('runningCount');
+      if (totalEl) totalEl.innerText = total;
+      if (runningEl) runningEl.innerText = running;
+    }
+
+    function create() {
+      fetch('/create', { method: 'POST' })
+        .then(r => r.json())
+        .then(d => add(d.sessionId));
+    }
+
+    function add(id, initIsRunning = false) {
+      const card = document.createElement('div');
+      card.className = 'session-card';
+      
+      const img = document.createElement('img');
+      card.appendChild(img);
+
+      // 添加正在执行的提示标签
+      const runningIndicator = document.createElement('div');
+      runningIndicator.className = 'running-indicator';
+      runningIndicator.innerText = '⏳ 正在执行...';
+      card.appendChild(runningIndicator);
+
+      // 1. 创建遮罩层
+      const overlay = document.createElement('div');
+      overlay.className = 'overlay';
+
+      const execBtn = document.createElement('button');
+      execBtn.className = 'btn-exec';
+      execBtn.innerText = '▶ 执行';
+      let isRunning = false;
+      execBtn.disabled = false; // 初始化时启用按钮
+      
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'card-actions';
+
+      const editBtn = document.createElement('button');
+      editBtn.className = 'icon-btn btn-edit';
+      editBtn.innerHTML = '⚙️';
+      editBtn.title = '编译 DSL';
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'icon-btn btn-close';
+      closeBtn.innerHTML = '✖';
+      closeBtn.title = '关闭浏览器';
+
+      actionsDiv.appendChild(editBtn);
+      actionsDiv.appendChild(closeBtn);
+      
+      overlay.appendChild(actionsDiv);
+      overlay.appendChild(execBtn);
+      card.appendChild(overlay);
+
+      // 2. 创建内部 DSL 编辑器浮层
+      const editorDiv = document.createElement('div');
+      editorDiv.className = 'dsl-editor';
+      
+      // DSL 选择下拉框
+      const selectDsl = document.createElement('select');
+      selectDsl.style.padding = "8px";
+      selectDsl.style.marginBottom = "10px";
+      selectDsl.innerHTML = '<option value="">-- 选择已保存的DSL快速填入 --</option>';
+      console.log('globalDSLs:', globalDSLs)
+      globalDSLs.forEach(d => {
+        selectDsl.innerHTML += `<option value='${d.content.replace(/'/g, "&#39;")}'>${d.name}</option>`;
+      });
+      selectDsl.onchange = (e) => {
+        if(e.target.value) textarea.value = e.target.value;
+      };
+
+      const textarea = document.createElement('textarea');
+      textarea.value = `[\n  {"type": "navigate", "url": "https://www.baidu.com"}\n ]`;
+      
+      // 用于保存上一次确认的 DSL 脚本内容
+      let lastSavedDsl = textarea.value;
+
+      const saveBtn = document.createElement('button');
+      saveBtn.innerText = '保存';
+      saveBtn.onclick = () => {
+        lastSavedDsl = textarea.value; // 更新保存记录
+        editorDiv.style.display = 'none';
+      };
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.innerText = '取消';
+      cancelBtn.style.marginLeft = '10px';
+      cancelBtn.style.backgroundColor = 'grey';
+      cancelBtn.onclick = () => {
+        textarea.value = lastSavedDsl; // 恢复为上次保存的内容
+        editorDiv.style.display = 'none';
+      };
+
+      const btnGroup = document.createElement('div');
+      btnGroup.style.marginTop = '10px';
+      btnGroup.style.textAlign = 'right'
+      btnGroup.appendChild(saveBtn);
+      btnGroup.appendChild(cancelBtn);
+      
+      editorDiv.appendChild(selectDsl);
+      editorDiv.appendChild(textarea);
+      editorDiv.appendChild(btnGroup);
+      card.appendChild(editorDiv);
+
+      // 3. 绑定事件
+      closeBtn.onclick = () => {
+        fetch(`/delete?id=${id}`);
+        card.remove();
+        updateStats(); // 卡片删除后更新统计
+      };
+
+      editBtn.onclick = () => {
+        selectDsl.value = ""; // 每次打开弹窗时，重置下拉选项状态为默认提示
+        editorDiv.style.display = 'flex';
+      };
+
+      const showRunningState = () => {
+        isRunning = true;
+        card.classList.add('running');
+        execBtn.innerText = '⏹ 终止';
+        execBtn.disabled = false;
+        updateStats(); // 开始执行时更新统计
+      };
+
+      const showStoppedState = () => {
+        isRunning = false;
+        card.classList.remove('running');
+        execBtn.innerText = '▶ 执行';
+        execBtn.disabled = false;
+        updateStats(); // 停止执行时更新统计
+      };
+
+      // 如果初始化时后端告知正在运行，则直接进入运行状态
+      if (initIsRunning) {
+        showRunningState();
+      }
+
+      execBtn.onclick = () => {
+        if (isRunning) {
+          // 终止执行的逻辑（示例：发送终止信号到服务器）
+          execBtn.disabled = true;
+          fetch(`/stop_dsl?id=${id}`, { method: 'POST' })
+            .then(() => showStoppedState());
+          return;
+        }
+        // 开始执行的逻辑
+        showRunningState();
+        fetch(`/run_dsl?id=${id}`, { method: 'POST', body: textarea.value })
+          .then(() => showStoppedState()); // 假设执行完成后恢复状态
+      };
+
+      document.getElementById('list').appendChild(card);
+
+      const ws = new WebSocket(`ws://${location.host}/ws?sessionId=${id}`);
+
+      ws.onmessage = (msg) => {
+        const data = JSON.parse(msg.data);
+        img.src = "data:image/jpeg;base64," + data.data;
+      };
+
+      updateStats(); // 卡片创建完成并挂载到 DOM 后更新统计
+    }
+
+
+    /*
+    * 其他脚本
+    */
+
+
+    // 前端页面加载时恢复
+    async function restoreSessions() {
+      if (window.sessionsRestored) return; // 避免重复执行
+      const res = await fetch('/list');
+      const data = await res.json();
+
+      if (data.sessions && data.sessions.length > 0) {
+        data.sessions.forEach(sessionInfo => {
+          add(sessionInfo.id, sessionInfo.isRunning);
+        });
+      }
+      window.sessionsRestored = true;
+    }
+
+     // --- DSL 管理逻辑 ---
+    
+    async function fetchDSLs() {
+      const res = await fetch('/api/dsl/list');
+      globalDSLs = await res.json();
+      renderDslList();
+    }
+
+    function renderDslList() {
+      const listDiv = document.getElementById('dslList');
+      listDiv.innerHTML = '';
+      const currentId = parseInt(document.getElementById('editDslId').value) || 0;
+      
+      globalDSLs.forEach(dsl => {
+        const item = document.createElement('div');
+        item.className = 'dsl-list-item' + (dsl.id === currentId ? ' active' : '');
+        item.innerText = dsl.name;
+        item.onclick = () => selectDsl(dsl);
+        listDiv.appendChild(item);
+      });
+    }
+
+    function selectDsl(dsl) {
+      document.getElementById('editDslId').value = dsl.id;
+      document.getElementById('editDslName').value = dsl.name;
+      dslEditor.setValue(dsl.content || '', -1);
+      document.getElementById('btnDelDsl').style.display = 'block';
+      renderDslList(); // 刷新高亮状态
+    }
+
+    function createNewDsl() {
+      document.getElementById('editDslId').value = 0;
+      document.getElementById('editDslName').value = '';
+      dslEditor.setValue('[\n  {"type": "navigate", "url": "https://..."}\n]', -1);
+      document.getElementById('btnDelDsl').style.display = 'none';
+      renderDslList();
+    }
+
+    async function saveCurrentDsl() {
+      const id = parseInt(document.getElementById('editDslId').value) || 0;
+      const name = document.getElementById('editDslName').value.trim();
+      const content = dslEditor.getValue().trim();
+      
+      if(!name) return alert("脚本名称不能为空");
+
+      // 添加保存前的 JSON 格式验证
+      try {
+        if (content) JSON.parse(content);
+      } catch (e) {
+        if(!confirm("JSON 格式似乎不正确，是否继续保存？\n" + e.message)) return;
+      }
+
+      const res = await fetch('/api/dsl/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, name, content })
+      });
+      const updatedDsl = await res.json();
+      
+      await fetchDSLs();
+      selectDsl(updatedDsl); // 保存后自动选中
+      alert('保存成功');
+    }
+
+    async function deleteCurrentDsl() {
+      const id = document.getElementById('editDslId').value;
+      if(!id || id == "0") return;
+      if(!confirm("确定要删除此脚本吗？")) return;
+
+      await fetch(`/api/dsl/delete?id=${id}`, { method: 'POST' });
+      createNewDsl();
+      fetchDSLs();
+    }
+
+    function openDslModal() {
+      createNewDsl(); //每次打开都重置为新建状态
+      document.getElementById('dslModal').style.display = 'flex';
+    }
+
+    function closeDslModal() {
+      document.getElementById('dslModal').style.display = 'none';
+    }
+
+    // 页面加载完成后自动触发
+    window.addEventListener('DOMContentLoaded', async () => {
+      // 初始化 JSON 编辑器
+      dslEditor = ace.edit("editDslContent");
+      dslEditor.setTheme("ace/theme/github");
+      dslEditor.session.setMode("ace/mode/json");
+      dslEditor.setOptions({
+        fontSize: "14px",
+        showPrintMargin: false,
+        wrap: true
+      });
+
+      await fetchDSLs(); // 确保先拉取完 DSL 数据并赋值给 globalDSLs
+      await restoreSessions(); // 然后再恢复会话卡片渲染，避免下拉框为空
+    });
+
+    function formatJson() {
+      const session = dslEditor.getSession();
+      session.setValue(JSON.stringify(JSON.parse(session.getValue()), null, 2));
+      dslEditor.clearSelection();
+    }
+  
+  /* CSS */
+  </script>
+  <style>
+  /* 正在执行时的卡片发光效果 */
+  .session-card.running {
+    box-shadow: 0 0 15px rgba(255, 165, 0, 0.6);
+    border-color: orange;
+  }
+  /* 提示标签基础样式（默认隐藏） */
+  .running-indicator {
+    display: none;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    background-color: rgba(255, 165, 0, 0.9);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: bold;
+    z-index: 10;
+    pointer-events: none;
+    animation: pulse-opacity 1s infinite alternate;
+  }
+  /* 卡片进入 running 状态时显示提示标签 */
+  .session-card.running .running-indicator {
+    display: block;
+  }
+  /* 呼吸灯透明度动画 */
+  @keyframes pulse-opacity {
+    from { opacity: 1; }
+    to { opacity: 0.4; }
+  }
+  
+  /* 卡片右上角操作区 */
+  .card-actions {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    gap: 8px;
+    z-index: 20;
+  }
+  .icon-btn {
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: white;
+    font-size: 14px;
+    height: 28px;
+    width: auto !important;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 6px;
+    transition: all 0.2s;
+  }
+  .icon-btn:hover {
+    background: rgba(0, 0, 0, 0.8);
+    transform: scale(1.05);
+  }
+  .icon-btn.btn-close:hover {
+    background: rgba(220, 53, 69, 0.9);
+  }
+  .icon-btn.btn-edit:hover {
+    background: #1890ff;
+  }
+  /* 确保执行按钮居中 */
+  .btn-exec {
+    position: absolute !important;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 10;
+  }
+  </style>
+
+  </script>
+
+</body>
+
+</html>
