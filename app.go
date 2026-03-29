@@ -13,6 +13,8 @@ var staticFiles embed.FS
 func main() {
 	// 初始化数据库
 	initDB()
+	go runGlobalWsHub() // 启动全局事件广播 Hub
+	initCronTasks()     // 初始化定时任务表并启动活跃任务
 
 	var err error
 	chromeExecutablePath, err = getChromePath()
@@ -29,6 +31,7 @@ func main() {
 	http.HandleFunc("/create", create)
 	http.HandleFunc("/navigate", navigate)
 	http.HandleFunc("/delete", del)
+	http.HandleFunc("/ws/events", globalEventsWsHandler)
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/list", listSessions)
 	http.HandleFunc("/click", click)
@@ -39,6 +42,10 @@ func main() {
 	http.HandleFunc("/api/dsl/list", apiListDSL)
 	http.HandleFunc("/api/dsl/save", apiSaveDSL)
 	http.HandleFunc("/api/dsl/delete", apiDeleteDSL)
+	http.HandleFunc("/api/cron/list", apiListCron)
+	http.HandleFunc("/api/cron/save", apiSaveCron)
+	http.HandleFunc("/api/cron/delete", apiDeleteCron)
+	http.HandleFunc("/api/cron/toggle", apiToggleCron)
 
 	log.Println("http://localhost:8080")
 	http.ListenAndServe(":8080", nil)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -365,14 +366,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type SessionInfo struct {
+	ID        string `json:"id"`
+	IsRunning bool   `json:"isRunning"`
+}
+
 func listSessions(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
-
-	type SessionInfo struct {
-		ID        string `json:"id"`
-		IsRunning bool   `json:"isRunning"`
-	}
 
 	var infos []SessionInfo
 	for id, s := range sessions {
@@ -503,4 +504,309 @@ func apiDeleteDSL(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	db.Exec("DELETE FROM dsl_scripts WHERE id=?", id)
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// --- 定时任务管理调度 ---
+
+type CronTask struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Schedule string `json:"schedule"`
+	DSLID    int    `json:"dslId"`
+	Status   int    `json:"status"` // 0: 停止, 1: 运行中
+}
+
+var activeCronJobs = make(map[int]context.CancelFunc)
+var cronMu sync.Mutex
+
+func initCronTasks() {
+	db.Exec(`CREATE TABLE IF NOT EXISTS cron_tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT,
+		schedule TEXT,
+		dsl_id INTEGER,
+		status INTEGER DEFAULT 0
+	)`)
+
+	// 重启应用时，自动恢复状态为“运行中”的定时任务
+	rows, err := db.Query("SELECT id, name, schedule, dsl_id, status FROM cron_tasks WHERE status=1")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var task CronTask
+			rows.Scan(&task.ID, &task.Name, &task.Schedule, &task.DSLID, &task.Status)
+			startCronJob(task)
+		}
+	}
+}
+
+func startCronJob(task CronTask) {
+	dur, err := time.ParseDuration(task.Schedule)
+	if err != nil {
+		fmt.Println("启动失败, 无效的时间格式:", task.Schedule)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cronMu.Lock()
+	if oldCancel, exists := activeCronJobs[task.ID]; exists {
+		oldCancel() // 取消可能正在运行的旧实例
+	}
+	activeCronJobs[task.ID] = cancel
+	cronMu.Unlock()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(dur):
+				// 每次到期后，抛入后台独立运行，避免阻塞下一个周期
+				go runCronDSL(task.DSLID)
+			}
+		}
+	}()
+}
+
+func stopCronJob(id int) {
+	cronMu.Lock()
+	if cancel, exists := activeCronJobs[id]; exists {
+		cancel()
+		delete(activeCronJobs, id)
+	}
+	cronMu.Unlock()
+}
+
+func runCronDSL(dslID int) {
+	var content string
+	err := db.QueryRow("SELECT content FROM dsl_scripts WHERE id=?", dslID).Scan(&content)
+	if err != nil {
+		return
+	}
+	var actions []DSLAction
+	json.Unmarshal([]byte(content), &actions)
+
+	// 1. 在后台初始化一个新的无头浏览器实例
+	id := fmt.Sprintf("cron-%d", time.Now().UnixNano())
+	mu.Lock()
+	port := nextPort
+	nextPort++
+	mu.Unlock()
+
+	cmd := launchChrome(chromeExecutablePath, port, "/tmp/chrome-"+id)
+	wsURL, err := getWSURL(port)
+	if err != nil {
+		cmd.Process.Kill()
+		return
+	}
+	client, err := NewClient(wsURL)
+	if err != nil {
+		cmd.Process.Kill()
+		return
+	}
+
+	client.Call("Page.enable", nil)
+	session := &Session{ID: id, Client: client, Cmd: cmd, WS: make(map[*websocket.Conn]bool)}
+	client.onClose = func() { deleteSession(id) }
+
+	// 监听帧回传
+	client.onEvent = func(method string, params json.RawMessage) {
+		if method == "Page.screencastFrame" {
+			var frame struct {
+				Data      string `json:"data"`
+				SessionID int    `json:"sessionId"`
+			}
+			json.Unmarshal(params, &frame)
+
+			session.wsMu.Lock()
+			session.lastFrame = frame.Data
+			for ws := range session.WS {
+				err := ws.WriteJSON(map[string]interface{}{
+					"sessionId": id,
+					"data":      frame.Data,
+				})
+				if err != nil {
+					ws.Close()
+					delete(session.WS, ws) // 自动清理死连接
+				}
+			}
+			session.wsMu.Unlock()
+
+			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
+		}
+	}
+
+	client.Call("Page.startScreencast", map[string]interface{}{"format": "jpeg", "quality": 50})
+
+	mu.Lock()
+	sessions[id] = session
+	mu.Unlock()
+
+	broadcastSessionEvent("session_added", SessionInfo{ID: id, IsRunning: true})
+
+	// 无论执行成功或发生错误，最终销毁关闭该次临时浏览器
+	defer func() {
+		deleteSession(id)
+		broadcastSessionEvent("session_removed", map[string]string{"id": id})
+	}()
+
+	// 2. 注入上下文并执行 DSL (防止僵尸任务，强制最多10分钟超时)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	session.wsMu.Lock()
+	session.cancelDSL = cancel
+	session.wsMu.Unlock()
+
+	executeDSLActions(ctx, session, actions)
+}
+
+// --- CRUD ---
+func apiListCron(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query("SELECT id, name, schedule, dsl_id, status FROM cron_tasks ORDER BY id DESC")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var tasks []CronTask
+	for rows.Next() {
+		var t CronTask
+		if err := rows.Scan(&t.ID, &t.Name, &t.Schedule, &t.DSLID, &t.Status); err == nil {
+			tasks = append(tasks, t)
+		}
+	}
+	if tasks == nil {
+		tasks = []CronTask{}
+	}
+	json.NewEncoder(w).Encode(tasks)
+}
+
+func apiSaveCron(w http.ResponseWriter, r *http.Request) {
+	var t CronTask
+	json.NewDecoder(r.Body).Decode(&t)
+	if t.ID == 0 {
+		res, _ := db.Exec("INSERT INTO cron_tasks (name, schedule, dsl_id, status) VALUES (?, ?, ?, 0)", t.Name, t.Schedule, t.DSLID)
+		id, _ := res.LastInsertId()
+		t.ID = int(id)
+	} else {
+		db.Exec("UPDATE cron_tasks SET name=?, schedule=?, dsl_id=? WHERE id=?", t.Name, t.Schedule, t.DSLID, t.ID)
+		if t.Status == 1 {
+			// 重新拉起以应用新周期
+			stopCronJob(t.ID)
+			startCronJob(t)
+		}
+	}
+	json.NewEncoder(w).Encode(t)
+}
+
+// --- Global WebSocket Hub for Events ---
+
+var globalWsHub = struct {
+	clients    map[*websocket.Conn]bool
+	mu         sync.Mutex
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+	broadcast  chan []byte
+}{
+	clients:    make(map[*websocket.Conn]bool),
+	register:   make(chan *websocket.Conn),
+	unregister: make(chan *websocket.Conn),
+	broadcast:  make(chan []byte, 128), // Buffered channel to prevent blocking
+}
+
+func runGlobalWsHub() {
+	for {
+		select {
+		case conn := <-globalWsHub.register:
+			globalWsHub.mu.Lock()
+			globalWsHub.clients[conn] = true
+			globalWsHub.mu.Unlock()
+		case conn := <-globalWsHub.unregister:
+			globalWsHub.mu.Lock()
+			if _, ok := globalWsHub.clients[conn]; ok {
+				delete(globalWsHub.clients, conn)
+				conn.Close()
+			}
+			globalWsHub.mu.Unlock()
+		case message := <-globalWsHub.broadcast:
+			globalWsHub.mu.Lock()
+			for conn := range globalWsHub.clients {
+				if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+					// On error, assume client disconnected, unregister them.
+					go func(c *websocket.Conn) {
+						globalWsHub.unregister <- c
+					}(conn)
+				}
+			}
+			globalWsHub.mu.Unlock()
+		}
+	}
+}
+
+func globalEventsWsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	globalWsHub.register <- conn
+
+	// When the client disconnects, unregister them.
+	defer func() { globalWsHub.unregister <- conn }()
+
+	// Keep the connection alive by reading messages (and discarding them).
+	// This loop will exit when the client disconnects, triggering the defer.
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+func broadcastSessionEvent(eventType string, payload interface{}) {
+	message, err := json.Marshal(map[string]interface{}{
+		"type":    eventType,
+		"payload": payload,
+	})
+	if err != nil {
+		fmt.Println("Error marshalling broadcast message:", err)
+		return
+	}
+
+	// Non-blocking send
+	select {
+	case globalWsHub.broadcast <- message:
+	default:
+		fmt.Println("Global hub broadcast channel is full. Message dropped.")
+	}
+}
+
+func apiDeleteCron(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	var id int
+	fmt.Sscanf(idStr, "%d", &id)
+	stopCronJob(id) // 先停止可能在运行的任务
+	db.Exec("DELETE FROM cron_tasks WHERE id=?", id)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+func apiToggleCron(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	var id int
+	fmt.Sscanf(idStr, "%d", &id)
+
+	var t CronTask
+	db.QueryRow("SELECT id, name, schedule, dsl_id, status FROM cron_tasks WHERE id=?", id).Scan(&t.ID, &t.Name, &t.Schedule, &t.DSLID, &t.Status)
+
+	if t.Status == 0 {
+		t.Status = 1
+		db.Exec("UPDATE cron_tasks SET status=1 WHERE id=?", id)
+		startCronJob(t)
+	} else {
+		t.Status = 0
+		db.Exec("UPDATE cron_tasks SET status=0 WHERE id=?", id)
+		stopCronJob(id)
+	}
+	json.NewEncoder(w).Encode(t)
 }

@@ -9,6 +9,7 @@
   <div class="toolbar" style="display: flex; align-items: center;">
     <button class="primary" onclick="create()">➕ 新建浏览器</button>
     <button onclick="openDslModal()">⚙️ DSL 管理</button>
+    <button onclick="openCronModal()" style="margin-left: 10px;">⏱️ 定时任务</button>
     <div style="margin-left: auto; font-size: 14px; font-weight: bold;">
       <span>浏览器总数: <span id="totalCount">0</span></span>
       <span style="margin: 0 10px; color: #ccc;">|</span>
@@ -44,10 +45,40 @@
     </div>
   </div>
 
+  <!-- 定时任务 模态框 -->
+  <div class="modal-overlay" id="cronModal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>⏱️ 定时任务管理</h2>
+        <button class="close-modal" onclick="closeCronModal()">✖</button>
+      </div>
+      <div class="modal-body">
+        <div class="dsl-sidebar">
+           <button class="btn-new" onclick="createNewCron()">➕ 新建任务</button>
+           <div id="cronList"></div>
+        </div>
+        <div class="dsl-main">
+           <input type="hidden" id="editCronId" value="0">
+           <input type="text" id="editCronName" placeholder="任务名称" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+           <input type="text" id="editCronSchedule" placeholder="时间间隔 (例如: 10s, 5m, 1h)" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+           <select id="editCronDslId" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+              <option value="0">-- 选择要执行的 DSL 脚本 --</option>
+           </select>
+           <div class="dsl-actions">
+             <button class="btn-format" id="btnToggleCron" onclick="toggleCurrentCron()" style="display:none; margin-right:auto;">▶ 启动任务</button>
+             <button class="btn-del" id="btnDelCron" onclick="deleteCurrentCron()" style="display:none;">删除</button>
+             <button class="btn-save" onclick="saveCurrentCron()">保存修改</button>
+           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 引入 Ace Editor 以提供良好的 JSON 编辑体验 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.js"></script>
   <script>
     let globalDSLs = [];
+    let globalCrons = [];
     let dslEditor;
 
     // 更新顶部导航栏的浏览器统计状态
@@ -69,6 +100,7 @@
     function add(id, initIsRunning = false) {
       const card = document.createElement('div');
       card.className = 'session-card';
+      card.dataset.sessionId = id; // 添加一个 data-* 属性用于选择
       
       const img = document.createElement('img');
       card.appendChild(img);
@@ -78,6 +110,15 @@
       runningIndicator.className = 'running-indicator';
       runningIndicator.innerText = '⏳ 正在执行...';
       card.appendChild(runningIndicator);
+
+      // 添加定时任务专属标识
+      const isCron = String(id).startsWith('cron-');
+      if (isCron) {
+        const cronIndicator = document.createElement('div');
+        cronIndicator.className = 'cron-indicator';
+        cronIndicator.innerText = '⏰ 定时任务';
+        card.appendChild(cronIndicator);
+      }
 
       // 1. 创建遮罩层
       const overlay = document.createElement('div');
@@ -321,6 +362,91 @@
       document.getElementById('dslModal').style.display = 'none';
     }
 
+    // --- 定时任务 管理逻辑 ---
+    async function fetchCrons() {
+      const res = await fetch('/api/cron/list');
+      globalCrons = await res.json();
+      renderCronList();
+    }
+    function renderCronList() {
+      const listDiv = document.getElementById('cronList');
+      listDiv.innerHTML = '';
+      const currentId = parseInt(document.getElementById('editCronId').value) || 0;
+      globalCrons.forEach(cron => {
+        const item = document.createElement('div');
+        item.className = 'dsl-list-item' + (cron.id === currentId ? ' active' : '');
+        const statusIcon = cron.status === 1 ? ' <span style="color:green;font-size:12px;">(运行中)</span>' : '';
+        item.innerHTML = cron.name + statusIcon;
+        item.onclick = () => selectCron(cron);
+        listDiv.appendChild(item);
+      });
+    }
+    function updateCronDslOptions() {
+      const select = document.getElementById('editCronDslId');
+      select.innerHTML = '<option value="0">-- 选择要执行的 DSL 脚本 --</option>';
+      globalDSLs.forEach(dsl => { select.innerHTML += `<option value="${dsl.id}">${dsl.name}</option>`; });
+    }
+    function selectCron(cron) {
+      document.getElementById('editCronId').value = cron.id;
+      document.getElementById('editCronName').value = cron.name;
+      document.getElementById('editCronSchedule').value = cron.schedule;
+      document.getElementById('editCronDslId').value = cron.dslId;
+      document.getElementById('btnDelCron').style.display = 'block';
+      const toggleBtn = document.getElementById('btnToggleCron');
+      toggleBtn.style.display = 'block';
+      if (cron.status === 1) {
+          toggleBtn.innerText = '⏹ 停止任务';
+          toggleBtn.style.backgroundColor = 'orange';
+          toggleBtn.style.color = 'white';
+          toggleBtn.style.border = 'none';
+      } else {
+          toggleBtn.innerText = '▶ 启动任务';
+          toggleBtn.style.backgroundColor = '#28a745';
+          toggleBtn.style.color = 'white';
+          toggleBtn.style.border = 'none';
+      }
+      renderCronList();
+    }
+    function createNewCron() {
+      document.getElementById('editCronId').value = 0;
+      document.getElementById('editCronName').value = '';
+      document.getElementById('editCronSchedule').value = '';
+      document.getElementById('editCronDslId').value = '0';
+      document.getElementById('btnDelCron').style.display = 'none';
+      document.getElementById('btnToggleCron').style.display = 'none';
+      renderCronList();
+    }
+    async function saveCurrentCron() {
+      const id = parseInt(document.getElementById('editCronId').value) || 0;
+      const name = document.getElementById('editCronName').value.trim();
+      const schedule = document.getElementById('editCronSchedule').value.trim();
+      const dslId = parseInt(document.getElementById('editCronDslId').value) || 0;
+      if(!name || !schedule || !dslId) return alert("请完整填写表单(名称/时间间隔/DSL脚本)");
+      const res = await fetch('/api/cron/save', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, name, schedule, dslId })
+      });
+      await fetchCrons();
+      selectCron(await res.json());
+      alert('保存成功');
+    }
+    async function deleteCurrentCron() {
+      const id = document.getElementById('editCronId').value;
+      if(!id || id == "0" || !confirm("确定要删除此定时任务吗？")) return;
+      await fetch(`/api/cron/delete?id=${id}`, { method: 'POST' });
+      createNewCron();
+      fetchCrons();
+    }
+    async function toggleCurrentCron() {
+      const id = document.getElementById('editCronId').value;
+      if(!id || id == "0") return;
+      const res = await fetch(`/api/cron/toggle?id=${id}`, { method: 'POST' });
+      await fetchCrons();
+      selectCron(await res.json());
+    }
+    function openCronModal() { updateCronDslOptions(); createNewCron(); document.getElementById('cronModal').style.display = 'flex'; }
+    function closeCronModal() { document.getElementById('cronModal').style.display = 'none'; }
+
     // 页面加载完成后自动触发
     window.addEventListener('DOMContentLoaded', async () => {
       // 初始化 JSON 编辑器
@@ -333,7 +459,31 @@
         wrap: true
       });
 
+      // 连接全局事件 WebSocket，用于接收会话创建/销毁的实时通知
+      const eventWs = new WebSocket(`ws://${location.host}/ws/events`);
+      eventWs.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log("Received global event:", msg);
+        if (msg.type === 'session_added') {
+          // 检查卡片是否已存在，避免因页面重载和消息推送导致重复添加
+          const existingCard = document.querySelector(`.session-card[data-session-id="${msg.payload.id}"]`);
+          if (!existingCard) {
+            add(msg.payload.id, msg.payload.isRunning);
+          }
+        } else if (msg.type === 'session_removed') {
+          const cardToRemove = document.querySelector(`.session-card[data-session-id="${msg.payload.id}"]`);
+          if (cardToRemove) {
+            cardToRemove.remove();
+            updateStats(); // 更新统计信息
+          }
+        }
+      };
+      eventWs.onclose = () => {
+        console.log("Global event WebSocket closed. Will attempt to reconnect on next page load.");
+      };
+
       await fetchDSLs(); // 确保先拉取完 DSL 数据并赋值给 globalDSLs
+      await fetchCrons();
       await restoreSessions(); // 然后再恢复会话卡片渲染，避免下拉框为空
     });
 
@@ -375,6 +525,21 @@
   @keyframes pulse-opacity {
     from { opacity: 1; }
     to { opacity: 0.4; }
+  }
+  
+  /* 定时任务提示标签 */
+  .cron-indicator {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    background-color: rgba(23, 162, 184, 0.9); /* 青色标识 */
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: bold;
+    z-index: 10;
+    pointer-events: none;
   }
   
   /* 卡片右上角操作区 */
