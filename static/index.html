@@ -1,19 +1,25 @@
 <!DOCTYPE html>
 <html>
+
 <head>
   <meta charset="utf-8">
- <title>Antinvo RPA</title>
- <link rel="stylesheet" href="style.css">
+  <title>Antinvo RPA</title>
+  <link rel="stylesheet" href="style.css">
 </head>
+
 <body>
   <div class="toolbar" style="display: flex; align-items: center;">
     <button class="primary" onclick="create()">➕ 新建浏览器</button>
-    <button onclick="openDslModal()">⚙️ DSL 管理</button>
-    <button onclick="openCronModal()" style="margin-left: 10px;">⏱️ 定时任务</button>
-    <div style="margin-left: auto; font-size: 14px; font-weight: bold;">
+    <button id="dslBtn" onclick="openDslModal()" style="display: none;">⚙️ DSL 管理</button>
+    <button id="cronBtn" onclick="openCronModal()" style="margin-left: 10px; display: none;">⏱️ 定时任务</button>
+    <div
+      style="flex: 1;font-size: 14px; font-weight: bold; display: flex; align-items: center; justify-content: center;">
       <span>浏览器总数: <span id="totalCount">0</span></span>
       <span style="margin: 0 10px; color: #ccc;">|</span>
       <span>运行中: <span id="runningCount" style="color: orange;">0</span></span>
+    </div>
+    <div id="userMenu" style="margin-right: 16px; display: flex; align-items: center; gap: 10px;">
+      <button id="loginBtn" onclick="window.location.href='/login'">登陆</button>
     </div>
   </div>
 
@@ -28,18 +34,20 @@
       </div>
       <div class="modal-body">
         <div class="dsl-sidebar">
-           <button class="btn-new" onclick="createNewDsl()">➕ 新建脚本</button>
-           <div id="dslList"></div>
+          <button class="btn-new" onclick="createNewDsl()">➕ 新建脚本</button>
+          <div id="dslList"></div>
         </div>
         <div class="dsl-main">
-           <input type="hidden" id="editDslId" value="0">
-           <input type="text" id="editDslName" placeholder="输入 DSL 脚本名称">
-           <div id="editDslContent" style="flex: 1; min-height: 0; width: 100%; border: 1px solid #ccc; border-radius: 4px; margin: 10px 0;"></div>
-           <div class="dsl-actions">
-             <button class="btn-format" onclick="formatJson()">✨ 格式化</button>
-             <button class="btn-del" id="btnDelDsl" onclick="deleteCurrentDsl()" style="display:none;">删除</button>
-             <button class="btn-save" onclick="saveCurrentDsl()">保存修改</button>
-           </div>
+          <input type="hidden" id="editDslId" value="0">
+          <input type="text" id="editDslName" placeholder="输入 DSL 脚本名称">
+          <div id="editDslContent"
+            style="flex: 1; min-height: 0; width: 100%; border: 1px solid #ccc; border-radius: 4px; margin: 10px 0;">
+          </div>
+          <div class="dsl-actions">
+            <button class="btn-format" onclick="formatJson()">✨ 格式化</button>
+            <button class="btn-del" id="btnDelDsl" onclick="deleteCurrentDsl()" style="display:none;">删除</button>
+            <button class="btn-save" onclick="saveCurrentDsl()">保存修改</button>
+          </div>
         </div>
       </div>
     </div>
@@ -54,21 +62,24 @@
       </div>
       <div class="modal-body">
         <div class="dsl-sidebar">
-           <button class="btn-new" onclick="createNewCron()">➕ 新建任务</button>
-           <div id="cronList"></div>
+          <button class="btn-new" onclick="createNewCron()">➕ 新建任务</button>
+          <div id="cronList"></div>
         </div>
         <div class="dsl-main">
-           <input type="hidden" id="editCronId" value="0">
-           <input type="text" id="editCronName" placeholder="任务名称" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
-           <input type="text" id="editCronSchedule" placeholder="时间间隔 (例如: 10s, 5m, 1h)" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
-           <select id="editCronDslId" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
-              <option value="0">-- 选择要执行的 DSL 脚本 --</option>
-           </select>
-           <div class="dsl-actions">
-             <button class="btn-format" id="btnToggleCron" onclick="toggleCurrentCron()" style="display:none; margin-right:auto;">▶ 启动任务</button>
-             <button class="btn-del" id="btnDelCron" onclick="deleteCurrentCron()" style="display:none;">删除</button>
-             <button class="btn-save" onclick="saveCurrentCron()">保存修改</button>
-           </div>
+          <input type="hidden" id="editCronId" value="0">
+          <input type="text" id="editCronName" placeholder="任务名称"
+            style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+          <input type="text" id="editCronSchedule" placeholder="时间间隔 (例如: 10s, 5m, 1h)"
+            style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+          <select id="editCronDslId" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+            <option value="0">-- 选择要执行的 DSL 脚本 --</option>
+          </select>
+          <div class="dsl-actions">
+            <button class="btn-format" id="btnToggleCron" onclick="toggleCurrentCron()"
+              style="display:none; margin-right:auto;">▶ 启动任务</button>
+            <button class="btn-del" id="btnDelCron" onclick="deleteCurrentCron()" style="display:none;">删除</button>
+            <button class="btn-save" onclick="saveCurrentCron()">保存修改</button>
+          </div>
         </div>
       </div>
     </div>
@@ -101,7 +112,7 @@
       const card = document.createElement('div');
       card.className = 'session-card';
       card.dataset.sessionId = id; // 添加一个 data-* 属性用于选择
-      
+
       const img = document.createElement('img');
       card.appendChild(img);
 
@@ -129,7 +140,7 @@
       execBtn.innerText = '▶ 执行';
       let isRunning = false;
       execBtn.disabled = false; // 初始化时启用按钮
-      
+
       const actionsDiv = document.createElement('div');
       actionsDiv.className = 'card-actions';
 
@@ -145,7 +156,7 @@
 
       actionsDiv.appendChild(editBtn);
       actionsDiv.appendChild(closeBtn);
-      
+
       overlay.appendChild(actionsDiv);
       overlay.appendChild(execBtn);
       card.appendChild(overlay);
@@ -153,7 +164,7 @@
       // 2. 创建内部 DSL 编辑器浮层
       const editorDiv = document.createElement('div');
       editorDiv.className = 'dsl-editor';
-      
+
       // DSL 选择下拉框
       const selectDsl = document.createElement('select');
       selectDsl.style.padding = "8px";
@@ -164,12 +175,12 @@
         selectDsl.innerHTML += `<option value='${d.content.replace(/'/g, "&#39;")}'>${d.name}</option>`;
       });
       selectDsl.onchange = (e) => {
-        if(e.target.value) textarea.value = e.target.value;
+        if (e.target.value) textarea.value = e.target.value;
       };
 
       const textarea = document.createElement('textarea');
       textarea.value = `[\n  {"type": "navigate", "url": "https://www.baidu.com"}\n ]`;
-      
+
       // 用于保存上一次确认的 DSL 脚本内容
       let lastSavedDsl = textarea.value;
 
@@ -194,7 +205,7 @@
       btnGroup.style.textAlign = 'right'
       btnGroup.appendChild(saveBtn);
       btnGroup.appendChild(cancelBtn);
-      
+
       editorDiv.appendChild(selectDsl);
       editorDiv.appendChild(textarea);
       editorDiv.appendChild(btnGroup);
@@ -252,8 +263,15 @@
       const ws = new WebSocket(`ws://${location.host}/ws?sessionId=${id}`);
 
       ws.onmessage = (msg) => {
-        const data = JSON.parse(msg.data);
-        img.src = "data:image/jpeg;base64," + data.data;
+        const message = JSON.parse(msg.data);
+
+        if (message.type === 'screencast') {
+          // 处理截图数据
+          img.src = "data:image/jpeg;base64," + message.data;
+        } else if (message.type === 'log') {
+          // 处理日志数据，例如打印到控制台或显示在页面上
+          console.log('CDP Log:', message.logType, message.payload);
+        }
       };
 
       updateStats(); // 卡片创建完成并挂载到 DOM 后更新统计
@@ -279,8 +297,8 @@
       window.sessionsRestored = true;
     }
 
-     // --- DSL 管理逻辑 ---
-    
+    // --- DSL 管理逻辑 ---
+
     async function fetchDSLs() {
       const res = await fetch('/api/dsl/list');
       globalDSLs = await res.json();
@@ -291,7 +309,7 @@
       const listDiv = document.getElementById('dslList');
       listDiv.innerHTML = '';
       const currentId = parseInt(document.getElementById('editDslId').value) || 0;
-      
+
       globalDSLs.forEach(dsl => {
         const item = document.createElement('div');
         item.className = 'dsl-list-item' + (dsl.id === currentId ? ' active' : '');
@@ -321,14 +339,14 @@
       const id = parseInt(document.getElementById('editDslId').value) || 0;
       const name = document.getElementById('editDslName').value.trim();
       const content = dslEditor.getValue().trim();
-      
-      if(!name) return alert("脚本名称不能为空");
+
+      if (!name) return alert("脚本名称不能为空");
 
       // 添加保存前的 JSON 格式验证
       try {
         if (content) JSON.parse(content);
       } catch (e) {
-        if(!confirm("JSON 格式似乎不正确，是否继续保存？\n" + e.message)) return;
+        if (!confirm("JSON 格式似乎不正确，是否继续保存？\n" + e.message)) return;
       }
 
       const res = await fetch('/api/dsl/save', {
@@ -337,7 +355,7 @@
         body: JSON.stringify({ id, name, content })
       });
       const updatedDsl = await res.json();
-      
+
       await fetchDSLs();
       selectDsl(updatedDsl); // 保存后自动选中
       alert('保存成功');
@@ -345,8 +363,8 @@
 
     async function deleteCurrentDsl() {
       const id = document.getElementById('editDslId').value;
-      if(!id || id == "0") return;
-      if(!confirm("确定要删除此脚本吗？")) return;
+      if (!id || id == "0") return;
+      if (!confirm("确定要删除此脚本吗？")) return;
 
       await fetch(`/api/dsl/delete?id=${id}`, { method: 'POST' });
       createNewDsl();
@@ -395,15 +413,15 @@
       const toggleBtn = document.getElementById('btnToggleCron');
       toggleBtn.style.display = 'block';
       if (cron.status === 1) {
-          toggleBtn.innerText = '⏹ 停止任务';
-          toggleBtn.style.backgroundColor = 'orange';
-          toggleBtn.style.color = 'white';
-          toggleBtn.style.border = 'none';
+        toggleBtn.innerText = '⏹ 停止任务';
+        toggleBtn.style.backgroundColor = 'orange';
+        toggleBtn.style.color = 'white';
+        toggleBtn.style.border = 'none';
       } else {
-          toggleBtn.innerText = '▶ 启动任务';
-          toggleBtn.style.backgroundColor = '#28a745';
-          toggleBtn.style.color = 'white';
-          toggleBtn.style.border = 'none';
+        toggleBtn.innerText = '▶ 启动任务';
+        toggleBtn.style.backgroundColor = '#28a745';
+        toggleBtn.style.color = 'white';
+        toggleBtn.style.border = 'none';
       }
       renderCronList();
     }
@@ -421,7 +439,7 @@
       const name = document.getElementById('editCronName').value.trim();
       const schedule = document.getElementById('editCronSchedule').value.trim();
       const dslId = parseInt(document.getElementById('editCronDslId').value) || 0;
-      if(!name || !schedule || !dslId) return alert("请完整填写表单(名称/时间间隔/DSL脚本)");
+      if (!name || !schedule || !dslId) return alert("请完整填写表单(名称/时间间隔/DSL脚本)");
       const res = await fetch('/api/cron/save', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, name, schedule, dslId })
@@ -432,14 +450,14 @@
     }
     async function deleteCurrentCron() {
       const id = document.getElementById('editCronId').value;
-      if(!id || id == "0" || !confirm("确定要删除此定时任务吗？")) return;
+      if (!id || id == "0" || !confirm("确定要删除此定时任务吗？")) return;
       await fetch(`/api/cron/delete?id=${id}`, { method: 'POST' });
       createNewCron();
       fetchCrons();
     }
     async function toggleCurrentCron() {
       const id = document.getElementById('editCronId').value;
-      if(!id || id == "0") return;
+      if (!id || id == "0") return;
       const res = await fetch(`/api/cron/toggle?id=${id}`, { method: 'POST' });
       await fetchCrons();
       selectCron(await res.json());
@@ -482,6 +500,21 @@
         console.log("Global event WebSocket closed. Will attempt to reconnect on next page load.");
       };
 
+      // 获取并显示当前登录用户信息
+      try {
+        const userRes = await fetch('/api/user/info');
+        if (userRes.ok) {
+          const user = await userRes.json();
+          const userMenu = document.getElementById('userMenu');
+          userMenu.innerHTML = `<span style="font-size: 14px;">欢迎, ${user.full_name}</span>
+                                <button onclick="window.location.href='/logout'">登出</button>`;
+          document.getElementById('dslBtn').style.display = 'inline-block';
+          document.getElementById('cronBtn').style.display = 'inline-block';
+        }
+      } catch (e) {
+        console.error("获取用户信息失败:", e);
+      }
+
       await fetchDSLs(); // 确保先拉取完 DSL 数据并赋值给 globalDSLs
       await fetchCrons();
       await restoreSessions(); // 然后再恢复会话卡片渲染，避免下拉框为空
@@ -492,98 +525,112 @@
       session.setValue(JSON.stringify(JSON.parse(session.getValue()), null, 2));
       dslEditor.clearSelection();
     }
-  
-  /* CSS */
+
+    /* CSS */
   </script>
   <style>
-  /* 正在执行时的卡片发光效果 */
-  .session-card.running {
-    box-shadow: 0 0 15px rgba(255, 165, 0, 0.6);
-    border-color: orange;
-  }
-  /* 提示标签基础样式（默认隐藏） */
-  .running-indicator {
-    display: none;
-    position: absolute;
-    top: 8px;
-    left: 8px;
-    background-color: rgba(255, 165, 0, 0.9);
-    color: white;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: bold;
-    z-index: 10;
-    pointer-events: none;
-    animation: pulse-opacity 1s infinite alternate;
-  }
-  /* 卡片进入 running 状态时显示提示标签 */
-  .session-card.running .running-indicator {
-    display: block;
-  }
-  /* 呼吸灯透明度动画 */
-  @keyframes pulse-opacity {
-    from { opacity: 1; }
-    to { opacity: 0.4; }
-  }
-  
-  /* 定时任务提示标签 */
-  .cron-indicator {
-    position: absolute;
-    bottom: 8px;
-    left: 8px;
-    background-color: rgba(23, 162, 184, 0.9); /* 青色标识 */
-    color: white;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: bold;
-    z-index: 10;
-    pointer-events: none;
-  }
-  
-  /* 卡片右上角操作区 */
-  .card-actions {
-    position: absolute;
-    top: 8px;
-    right: 8px;
-    display: flex;
-    gap: 8px;
-    z-index: 20;
-  }
-  .icon-btn {
-    background: rgba(0, 0, 0, 0.5);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: white;
-    font-size: 14px;
-    height: 28px;
-    width: auto !important;
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0 6px;
-    transition: all 0.2s;
-  }
-  .icon-btn:hover {
-    background: rgba(0, 0, 0, 0.8);
-    transform: scale(1.05);
-  }
-  .icon-btn.btn-close:hover {
-    background: rgba(220, 53, 69, 0.9);
-  }
-  .icon-btn.btn-edit:hover {
-    background: #1890ff;
-  }
-  /* 确保执行按钮居中 */
-  .btn-exec {
-    position: absolute !important;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 10;
-  }
+    /* 正在执行时的卡片发光效果 */
+    .session-card.running {
+      box-shadow: 0 0 15px rgba(255, 165, 0, 0.6);
+      border-color: orange;
+    }
+
+    /* 提示标签基础样式（默认隐藏） */
+    .running-indicator {
+      display: none;
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      background-color: rgba(255, 165, 0, 0.9);
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: bold;
+      z-index: 10;
+      pointer-events: none;
+      animation: pulse-opacity 1s infinite alternate;
+    }
+
+    /* 卡片进入 running 状态时显示提示标签 */
+    .session-card.running .running-indicator {
+      display: block;
+    }
+
+    /* 呼吸灯透明度动画 */
+    @keyframes pulse-opacity {
+      from {
+        opacity: 1;
+      }
+
+      to {
+        opacity: 0.4;
+      }
+    }
+
+    /* 定时任务提示标签 */
+    .cron-indicator {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      background-color: rgba(23, 162, 184, 0.9);
+      /* 青色标识 */
+      color: white;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: bold;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    /* 卡片右上角操作区 */
+    .card-actions {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: flex;
+      gap: 8px;
+      z-index: 20;
+    }
+
+    .icon-btn {
+      background: rgba(0, 0, 0, 0.5);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: white;
+      font-size: 14px;
+      height: 28px;
+      width: auto !important;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 6px;
+      transition: all 0.2s;
+    }
+
+    .icon-btn:hover {
+      background: rgba(0, 0, 0, 0.8);
+      transform: scale(1.05);
+    }
+
+    .icon-btn.btn-close:hover {
+      background: rgba(220, 53, 69, 0.9);
+    }
+
+    .icon-btn.btn-edit:hover {
+      background: #1890ff;
+    }
+
+    /* 确保执行按钮居中 */
+    .btn-exec {
+      position: absolute !important;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 10;
+    }
   </style>
 
   </script>

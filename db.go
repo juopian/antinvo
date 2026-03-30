@@ -10,9 +10,11 @@ import (
 var db *sql.DB
 
 type DSL struct {
-	ID      int    `json:"id"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Content   string `json:"content"`
+	CreatorID string `json:"creatorId,omitempty"`
+	CreatedAt string `json:"createdAt,omitempty"`
 }
 
 func initDB() {
@@ -28,7 +30,9 @@ func initDB() {
 	CREATE TABLE IF NOT EXISTS dsl_scripts (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL,
-		content TEXT NOT NULL
+		content TEXT NOT NULL,
+		creator_id TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	`
 	_, err = db.Exec(sqlStmt)

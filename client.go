@@ -15,15 +15,22 @@ type CDPRequest struct {
 	Params interface{} `json:"params,omitempty"`
 }
 
-type Client struct {
-	conn    *websocket.Conn
-	nextID  int
-	pending map[int]chan map[string]json.RawMessage
-	mu      sync.Mutex
-	writeMu sync.Mutex
+type pendingRequest struct {
+	ch     chan map[string]json.RawMessage
+	method string
+}
 
-	onEvent func(string, json.RawMessage)
-	onClose func()
+type Client struct {
+	conn    *websocket.Conn        // WebSocket 连接
+	nextID  int                    // 下一个请求 ID
+	pending map[int]pendingRequest // 待处理的请求及其方法
+	mu      sync.Mutex             // 保护 pending 和 nextID
+	writeMu sync.Mutex             // 保护 conn.WriteJSON
+
+	onEvent    func(string, json.RawMessage)
+	onCall     func(id int, method string, params interface{})                     // 收到发出的 CDP Call 时回调
+	onResponse func(id int, method string, rawResponse map[string]json.RawMessage) // 收到 CDP 响应时回调，带上原始方法名
+	onClose    func()
 }
 
 func NewClient(wsURL string) (*Client, error) {
@@ -37,7 +44,7 @@ func NewClient(wsURL string) (*Client, error) {
 
 	c := &Client{
 		conn:    conn,
-		pending: make(map[int]chan map[string]json.RawMessage),
+		pending: make(map[int]pendingRequest),
 	}
 
 	go c.readLoop()
@@ -49,11 +56,13 @@ func (c *Client) Call(method string, params interface{}) (json.RawMessage, error
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++
-	ch := make(chan map[string]json.RawMessage, 1)
-	//print id and params
-	fmt.Println("call: id:", id, "method:", method, "params:", params)
-	c.pending[id] = ch
+	// 存储请求的 ID 和对应的方法
+	c.pending[id] = pendingRequest{ch: make(chan map[string]json.RawMessage, 1), method: method}
 	c.mu.Unlock()
+
+	if c.onCall != nil && method != "Page.screencastFrameAck" {
+		c.onCall(id, method, params)
+	}
 
 	c.writeMu.Lock()
 	err := c.conn.WriteJSON(CDPRequest{ID: id, Method: method, Params: params})
@@ -63,7 +72,7 @@ func (c *Client) Call(method string, params interface{}) (json.RawMessage, error
 	}
 
 	select {
-	case resp := <-ch:
+	case resp := <-c.pending[id].ch: // 从通道读取响应
 		if errRaw, ok := resp["error"]; ok {
 			return nil, fmt.Errorf("CDP error: %s", string(errRaw))
 		}
@@ -103,11 +112,19 @@ func (c *Client) readLoop() {
 			var id int
 			json.Unmarshal(idRaw, &id)
 
-			fmt.Println("data:", string(data))
-
-			c.mu.Lock()
-			if ch, ok := c.pending[id]; ok {
-				ch <- raw
+			if c.onResponse != nil {
+				c.mu.Lock() // 需要先锁定，以便访问 pending map 获取 method
+				pendingReq, ok := c.pending[id]
+				c.mu.Unlock()
+				if ok {
+					// 仅在找到了对应 ID 的请求时，才触发 onResponse
+					c.onResponse(id, pendingReq.method, raw)
+				}
+			}
+			c.mu.Lock() // 再次锁定以更新 pending map
+			if pendingReq, ok := c.pending[id]; ok {
+				pendingReq.ch <- raw
+				// ch <- raw
 				delete(c.pending, id)
 			}
 			c.mu.Unlock()

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -21,17 +23,19 @@ func create(w http.ResponseWriter, r *http.Request) {
 	port := nextPort
 	nextPort++
 
-	cmd := launchChrome(chromeExecutablePath, port, "/tmp/chrome-"+id)
+	userDataDir := filepath.Join(os.TempDir(), "chrome-"+id)
+	cmd := launchChrome(chromeExecutablePath, port, userDataDir)
 	wsURL, err := getWSURL(port)
 	if err != nil {
 		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Println("wsUrl", wsURL, "port", port)
 	client, err := NewClient(wsURL)
 	if err != nil {
 		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -41,14 +45,61 @@ func create(w http.ResponseWriter, r *http.Request) {
 	// client.Call("Page.navigate", map[string]interface{}{"url": "about:blank"})
 
 	session := &Session{
-		ID:     id,
-		Client: client,
-		Cmd:    cmd,
-		WS:     make(map[*websocket.Conn]bool),
+		ID:          id,
+		Client:      client,
+		Cmd:         cmd,
+		UserDataDir: userDataDir,
+		WS:          make(map[*websocket.Conn]bool),
+		broadcast:   make(chan []byte, 256),
 	}
+	go session.broadcastLoop()
 
 	client.onClose = func() {
 		deleteSession(id)
+	}
+
+	// Callback for outgoing DevTools Protocol calls
+	client.onCall = func(id int, method string, params interface{}) {
+		if method == "Page.screencastFrameAck" { // 不记录发出的 ACK 消息
+			return
+		}
+		logPayload := map[string]interface{}{
+			"id":     id,
+			"method": method,
+			"params": params,
+		}
+		message, _ := json.Marshal(map[string]interface{}{
+			"type":      "log",
+			"logType":   "request",
+			"sessionId": session.ID,
+			"payload":   logPayload,
+		})
+
+		select {
+		case session.broadcast <- message:
+		default:
+			fmt.Printf("Session %s: broadcast channel full, dropping request log.\n", session.ID)
+		}
+	}
+
+	// Callback for incoming DevTools Protocol responses
+	client.onResponse = func(id int, method string, rawResponse map[string]json.RawMessage) {
+		// 排除 Page.screencastFrameAck 的响应，这类消息过于频繁
+		if method == "Page.screencastFrameAck" {
+			return
+		}
+		message, _ := json.Marshal(map[string]interface{}{
+			"type":      "log",
+			"logType":   "response",
+			"sessionId": session.ID,
+			"payload":   rawResponse,
+		})
+
+		select {
+		case session.broadcast <- message:
+		default:
+			fmt.Printf("Session %s: broadcast channel full, dropping response log.\n", session.ID)
+		}
 	}
 
 	// 监听帧
@@ -60,24 +111,25 @@ func create(w http.ResponseWriter, r *http.Request) {
 			}
 			json.Unmarshal(params, &frame)
 
-			session.wsMu.Lock()
-			session.lastFrame = frame.Data
-			for ws := range session.WS {
-				err := ws.WriteJSON(map[string]interface{}{
-					"sessionId": id,
-					"data":      frame.Data,
-				})
-				if err != nil {
-					ws.Close()
-					delete(session.WS, ws) // 前端刷新导致连接断开时，自动清理死连接
-				}
-			}
-			session.wsMu.Unlock()
+			s := session // capture session for the closure
+			s.wsMu.Lock()
+			s.lastFrame = frame.Data
+			s.wsMu.Unlock()
 
-			// 必须 ACK，放到独立的 goroutine 中避免阻塞 readLoop 的循环读取
-			go client.Call("Page.screencastFrameAck", map[string]interface{}{
-				"sessionId": frame.SessionID,
+			message, _ := json.Marshal(map[string]interface{}{
+				"type":      "screencast",
+				"sessionId": s.ID,
+				"data":      frame.Data,
 			})
+
+			select {
+			case s.broadcast <- message:
+			default:
+				fmt.Printf("Session %s: broadcast channel full, dropping screencast frame.\n", s.ID)
+			}
+
+			// 必须为收到的每一个 frame 进行 ACK，否则浏览器会停止发送。
+			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
 		}
 	}
 
@@ -90,30 +142,6 @@ func create(w http.ResponseWriter, r *http.Request) {
 	sessions[id] = session
 
 	json.NewEncoder(w).Encode(map[string]string{"sessionId": id})
-}
-
-func navigate(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	url := r.URL.Query().Get("url")
-	if url == "" {
-		http.Error(w, "url parameter is missing", http.StatusBadRequest)
-		return
-	}
-
-	mu.Lock()
-	s, ok := sessions[id]
-	mu.Unlock()
-
-	if ok {
-		raw, err := s.Client.Call("Page.navigate", map[string]interface{}{
-			"url": url,
-		})
-		if err == nil {
-			w.Write(raw)
-		} else {
-			w.Write([]byte(err.Error()))
-		}
-	}
 }
 
 // DSLAction 定义了单个自动化操作的结构
@@ -266,7 +294,6 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction) {
 				"code": action.Value,
 			})
 		case "wait":
-			fmt.Println("wait:", action.Ms)
 			select {
 			case <-time.After(time.Duration(action.Ms) * time.Millisecond):
 			case <-ctx.Done():
@@ -330,9 +357,14 @@ func del(w http.ResponseWriter, r *http.Request) {
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("sessionId")
 
-	conn, _ := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	// The connection is automatically closed by the server when this handler returns.
+	// We will keep it open by not returning, but we need a mechanism to close it.
+	// The broadcast loop will close it on write error.
 
-	// Find session without holding the lock for too long
 	mu.Lock()
 	s, ok := sessions[id]
 	mu.Unlock()
@@ -342,28 +374,25 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add connection to session and get the last frame
 	s.wsMu.Lock()
-	s.WS[conn] = true
 	lastFrame := s.lastFrame
 	s.wsMu.Unlock()
 
-	// If a frame was cached, send it to the new connection immediately.
-	// This is done outside the lock to avoid blocking during network I/O.
 	if lastFrame != "" {
-		err := conn.WriteJSON(map[string]interface{}{
+		message, _ := json.Marshal(map[string]interface{}{
+			"type":      "screencast",
 			"sessionId": id,
 			"data":      lastFrame,
 		})
-		// If sending fails, the connection is bad. The main broadcast loop will also
-		// clean it up, but we can be proactive.
-		if err != nil {
-			s.wsMu.Lock()
-			delete(s.WS, conn)
-			s.wsMu.Unlock()
+		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			conn.Close()
+			return
 		}
 	}
+
+	s.wsMu.Lock()
+	s.WS[conn] = true
+	s.wsMu.Unlock()
 }
 
 type SessionInfo struct {
@@ -387,83 +416,10 @@ func listSessions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": infos})
 }
 
-func click(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	selector := r.URL.Query().Get("selector")
-	if selector == "" {
-		http.Error(w, "selector parameter is missing", http.StatusBadRequest)
-		return
-	}
-
-	mu.Lock()
-	s, ok := sessions[id]
-	mu.Unlock()
-
-	if ok {
-		expression := fmt.Sprintf("document.querySelector(`%s`).click()", selector)
-		raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{
-			"expression": expression,
-		})
-		if err == nil {
-			w.Write(raw)
-		} else {
-			w.Write([]byte(err.Error()))
-		}
-	}
-}
-
-func input(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	selector := r.URL.Query().Get("selector")
-	value := r.URL.Query().Get("value")
-
-	mu.Lock()
-	s, ok := sessions[id]
-	mu.Unlock()
-
-	if ok {
-		expression := fmt.Sprintf("document.querySelector(`%s`).value = `%s`", selector, value)
-		_, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{
-			"expression": expression,
-		})
-		if err != nil {
-			w.Write([]byte(err.Error()))
-		}
-	}
-}
-
-func selectOption(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
-	selector := r.URL.Query().Get("selector")
-	value := r.URL.Query().Get("value")
-
-	mu.Lock()
-	s, ok := sessions[id]
-	mu.Unlock()
-
-	if ok {
-		expression := fmt.Sprintf(`
-		  var selectElement = document.querySelector("%s");
-		  selectElement.value = "%s";
-		  var event = new Event('change', {
-		    'bubbles': true,
-		    'cancelable': true
-		  });
-		  selectElement.dispatchEvent(event);
-		`, selector, value)
-		_, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{
-			"expression": expression,
-		})
-		if err != nil {
-			w.Write([]byte(err.Error()))
-		}
-	}
-}
-
 // --- DSL Management CRUD ---
-
 func apiListDSL(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, name, content FROM dsl_scripts ORDER BY id DESC")
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+	rows, err := db.Query("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM dsl_scripts WHERE creator_id = ? ORDER BY id DESC", userInfo.OaID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -473,7 +429,8 @@ func apiListDSL(w http.ResponseWriter, r *http.Request) {
 	var dsls []DSL
 	for rows.Next() {
 		var d DSL
-		if err := rows.Scan(&d.ID, &d.Name, &d.Content); err == nil {
+		// Assuming new records will have these fields populated.
+		if err := rows.Scan(&d.ID, &d.Name, &d.Content, &d.CreatorID, &d.CreatedAt); err == nil {
 			dsls = append(dsls, d)
 		}
 	}
@@ -490,30 +447,52 @@ func apiSaveDSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
 	if dsl.ID == 0 {
-		res, _ := db.Exec("INSERT INTO dsl_scripts (name, content) VALUES (?, ?)", dsl.Name, dsl.Content)
+		res, _ := db.Exec("INSERT INTO dsl_scripts (name, content, creator_id) VALUES (?, ?, ?)", dsl.Name, dsl.Content, userInfo.OaID)
 		id, _ := res.LastInsertId()
 		dsl.ID = int(id)
 	} else {
-		db.Exec("UPDATE dsl_scripts SET name=?, content=? WHERE id=?", dsl.Name, dsl.Content, dsl.ID)
+		// Security check: ensure user owns this DSL
+		var owner string
+		err := db.QueryRow("SELECT creator_id FROM dsl_scripts WHERE id=?", dsl.ID).Scan(&owner)
+		if err != nil || owner != userInfo.OaID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		db.Exec("UPDATE dsl_scripts SET name=?, content=? WHERE id=? AND creator_id=?", dsl.Name, dsl.Content, dsl.ID, userInfo.OaID)
 	}
-	json.NewEncoder(w).Encode(dsl)
+
+	var finalDsl DSL
+	db.QueryRow("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM dsl_scripts WHERE id=?", dsl.ID).Scan(&finalDsl.ID, &finalDsl.Name, &finalDsl.Content, &finalDsl.CreatorID, &finalDsl.CreatedAt)
+	json.NewEncoder(w).Encode(finalDsl)
 }
 
 func apiDeleteDSL(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	db.Exec("DELETE FROM dsl_scripts WHERE id=?", id)
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	var owner string
+	err := db.QueryRow("SELECT creator_id FROM dsl_scripts WHERE id=?", id).Scan(&owner)
+	if err != nil || owner != userInfo.OaID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	db.Exec("DELETE FROM dsl_scripts WHERE id=? AND creator_id=?", id, userInfo.OaID)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
 // --- 定时任务管理调度 ---
 
 type CronTask struct {
-	ID       int    `json:"id"`
-	Name     string `json:"name"`
-	Schedule string `json:"schedule"`
-	DSLID    int    `json:"dslId"`
-	Status   int    `json:"status"` // 0: 停止, 1: 运行中
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Schedule  string `json:"schedule"`
+	DSLID     int    `json:"dslId"`
+	Status    int    `json:"status"` // 0: 停止, 1: 运行中
+	CreatorID string `json:"creatorId,omitempty"`
+	CreatedAt string `json:"createdAt,omitempty"`
 }
 
 var activeCronJobs = make(map[int]context.CancelFunc)
@@ -525,7 +504,9 @@ func initCronTasks() {
 		name TEXT,
 		schedule TEXT,
 		dsl_id INTEGER,
-		status INTEGER DEFAULT 0
+		status INTEGER DEFAULT 0,
+		creator_id TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
 
 	// 重启应用时，自动恢复状态为“运行中”的定时任务
@@ -593,20 +574,23 @@ func runCronDSL(dslID int) {
 	nextPort++
 	mu.Unlock()
 
-	cmd := launchChrome(chromeExecutablePath, port, "/tmp/chrome-"+id)
+	userDataDir := filepath.Join(os.TempDir(), "chrome-"+id)
+	cmd := launchChrome(chromeExecutablePath, port, userDataDir)
 	wsURL, err := getWSURL(port)
 	if err != nil {
 		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
 		return
 	}
 	client, err := NewClient(wsURL)
 	if err != nil {
 		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
 		return
 	}
 
 	client.Call("Page.enable", nil)
-	session := &Session{ID: id, Client: client, Cmd: cmd, WS: make(map[*websocket.Conn]bool)}
+	session := &Session{ID: id, Client: client, Cmd: cmd, UserDataDir: userDataDir, WS: make(map[*websocket.Conn]bool)}
 	client.onClose = func() { deleteSession(id) }
 
 	// 监听帧回传
@@ -630,8 +614,9 @@ func runCronDSL(dslID int) {
 					delete(session.WS, ws) // 自动清理死连接
 				}
 			}
-			session.wsMu.Unlock()
 
+			session.wsMu.Unlock()
+			// 必须为收到的每一个 frame 进行 ACK，否则浏览器会停止发送。
 			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
 		}
 	}
@@ -663,7 +648,8 @@ func runCronDSL(dslID int) {
 
 // --- CRUD ---
 func apiListCron(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, name, schedule, dsl_id, status FROM cron_tasks ORDER BY id DESC")
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+	rows, err := db.Query("SELECT id, name, schedule, dsl_id, status, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM cron_tasks WHERE creator_id = ? ORDER BY id DESC", userInfo.OaID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -673,7 +659,8 @@ func apiListCron(w http.ResponseWriter, r *http.Request) {
 	var tasks []CronTask
 	for rows.Next() {
 		var t CronTask
-		if err := rows.Scan(&t.ID, &t.Name, &t.Schedule, &t.DSLID, &t.Status); err == nil {
+		// Assuming new records will have these fields populated.
+		if err := rows.Scan(&t.ID, &t.Name, &t.Schedule, &t.DSLID, &t.Status, &t.CreatorID, &t.CreatedAt); err == nil {
 			tasks = append(tasks, t)
 		}
 	}
@@ -686,19 +673,47 @@ func apiListCron(w http.ResponseWriter, r *http.Request) {
 func apiSaveCron(w http.ResponseWriter, r *http.Request) {
 	var t CronTask
 	json.NewDecoder(r.Body).Decode(&t)
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	// 安全检查：确保所选的 DSL 脚本属于当前用户
+	if t.DSLID > 0 {
+		var dslOwner string
+		err := db.QueryRow("SELECT creator_id FROM dsl_scripts WHERE id=?", t.DSLID).Scan(&dslOwner)
+		if err != nil || dslOwner != userInfo.OaID {
+			http.Error(w, "Forbidden: selected DSL does not belong to you.", http.StatusForbidden)
+			return
+		}
+	}
+
 	if t.ID == 0 {
-		res, _ := db.Exec("INSERT INTO cron_tasks (name, schedule, dsl_id, status) VALUES (?, ?, ?, 0)", t.Name, t.Schedule, t.DSLID)
+		res, _ := db.Exec("INSERT INTO cron_tasks (name, schedule, dsl_id, status, creator_id) VALUES (?, ?, ?, 0, ?)", t.Name, t.Schedule, t.DSLID, userInfo.OaID)
 		id, _ := res.LastInsertId()
 		t.ID = int(id)
 	} else {
-		db.Exec("UPDATE cron_tasks SET name=?, schedule=?, dsl_id=? WHERE id=?", t.Name, t.Schedule, t.DSLID, t.ID)
-		if t.Status == 1 {
-			// 重新拉起以应用新周期
+		// 安全检查：确保当前用户是此定时任务的所有者
+		var cronOwner string
+		var currentStatus int
+		err := db.QueryRow("SELECT creator_id, status FROM cron_tasks WHERE id=?", t.ID).Scan(&cronOwner, &currentStatus)
+		if err != nil || cronOwner != userInfo.OaID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		db.Exec("UPDATE cron_tasks SET name=?, schedule=?, dsl_id=? WHERE id=? AND creator_id=?", t.Name, t.Schedule, t.DSLID, t.ID, userInfo.OaID)
+
+		// 如果任务原本就在运行，则重启以应用新的时间间隔
+		if currentStatus == 1 {
+			var updatedTask CronTask
+			db.QueryRow("SELECT id, name, schedule, dsl_id, status FROM cron_tasks WHERE id=?", t.ID).Scan(&updatedTask.ID, &updatedTask.Name, &updatedTask.Schedule, &updatedTask.DSLID, &updatedTask.Status)
 			stopCronJob(t.ID)
-			startCronJob(t)
+			startCronJob(updatedTask)
 		}
 	}
-	json.NewEncoder(w).Encode(t)
+
+	// 重新从数据库获取完整的任务信息并返回给前端
+	var finalTask CronTask
+	db.QueryRow("SELECT id, name, schedule, dsl_id, status, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM cron_tasks WHERE id=?", t.ID).Scan(&finalTask.ID, &finalTask.Name, &finalTask.Schedule, &finalTask.DSLID, &finalTask.Status, &finalTask.CreatorID, &finalTask.CreatedAt)
+	json.NewEncoder(w).Encode(finalTask)
 }
 
 // --- Global WebSocket Hub for Events ---
@@ -784,15 +799,33 @@ func broadcastSessionEvent(eventType string, payload interface{}) {
 
 func apiDeleteCron(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("id")
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	var owner string
+	err := db.QueryRow("SELECT creator_id FROM cron_tasks WHERE id=?", idStr).Scan(&owner)
+	if err != nil || owner != userInfo.OaID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	var id int
 	fmt.Sscanf(idStr, "%d", &id)
 	stopCronJob(id) // 先停止可能在运行的任务
-	db.Exec("DELETE FROM cron_tasks WHERE id=?", id)
+	db.Exec("DELETE FROM cron_tasks WHERE id=? AND creator_id=?", id, userInfo.OaID)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
 func apiToggleCron(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("id")
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	var owner string
+	err := db.QueryRow("SELECT creator_id FROM cron_tasks WHERE id=?", idStr).Scan(&owner)
+	if err != nil || owner != userInfo.OaID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
 	var id int
 	fmt.Sscanf(idStr, "%d", &id)
 
@@ -800,13 +833,14 @@ func apiToggleCron(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow("SELECT id, name, schedule, dsl_id, status FROM cron_tasks WHERE id=?", id).Scan(&t.ID, &t.Name, &t.Schedule, &t.DSLID, &t.Status)
 
 	if t.Status == 0 {
-		t.Status = 1
 		db.Exec("UPDATE cron_tasks SET status=1 WHERE id=?", id)
 		startCronJob(t)
 	} else {
-		t.Status = 0
 		db.Exec("UPDATE cron_tasks SET status=0 WHERE id=?", id)
 		stopCronJob(id)
 	}
-	json.NewEncoder(w).Encode(t)
+
+	var finalTask CronTask
+	db.QueryRow("SELECT id, name, schedule, dsl_id, status, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM cron_tasks WHERE id=?", t.ID).Scan(&finalTask.ID, &finalTask.Name, &finalTask.Schedule, &finalTask.DSLID, &finalTask.Status, &finalTask.CreatorID, &finalTask.CreatedAt)
+	json.NewEncoder(w).Encode(finalTask)
 }
