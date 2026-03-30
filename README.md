@@ -76,3 +76,59 @@ GOOS=windows GOARCH=amd64 go build -o antinvo-windows.exe .
 - `GET /selectOption?id={id}&selector={selector}&value={value}`: 选择下拉框选项
 - `GET /delete?id={id}`: 销毁指定会话及浏览器进程
 - `WS /ws?sessionId={id}`: 接收屏幕截图广播帧
+
+
+### sample DSL
+
+`
+[
+  {
+    "type": "navigate",
+    "url": "https://www.baidu.com/"
+  },
+  {
+    "type": "wait",
+    "ms": 300
+  },
+  {
+    "type": "click",
+    "selector": "a[name=tj_login]"
+  },
+  {
+    "type": "wait",
+    "ms": 1000
+  },
+  {
+    "type": "click",
+    "selector": ".login-type-tab .switch-item:last-child"
+  },
+  {
+    "type": "input",
+    "selector": ".pass-text-input-smsPhone",
+    "value": "18620011202"
+  },
+  {
+    "type": "click",
+    "selector": "button.pass-item-timer"
+  },
+  {
+    "type": "wait",
+    "ms": 1000
+  },
+  {
+    "type": "wait_for_input",
+    "inputType": "prompt",
+    "prompt": "请输入6位短信验证码",
+    "variableName": "smsCode"
+  },
+  {
+    "type": "input",
+    "selector": ".pass-text-input-smsVerifyCode",
+    "value": "{{smsCode}}"
+  },
+  {
+    "type": "click",
+    "selector": ".pass-button-submit"
+  }
+]
+`

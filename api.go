@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
@@ -45,12 +47,13 @@ func create(w http.ResponseWriter, r *http.Request) {
 	// client.Call("Page.navigate", map[string]interface{}{"url": "about:blank"})
 
 	session := &Session{
-		ID:          id,
-		Client:      client,
-		Cmd:         cmd,
-		UserDataDir: userDataDir,
-		WS:          make(map[*websocket.Conn]bool),
-		broadcast:   make(chan []byte, 256),
+		ID:            id,
+		Client:        client,
+		Cmd:           cmd,
+		UserDataDir:   userDataDir,
+		WS:            make(map[*websocket.Conn]bool),
+		broadcast:     make(chan []byte, 256),
+		userInputChan: make(chan string, 1),
 	}
 	go session.broadcastLoop()
 
@@ -75,6 +78,12 @@ func create(w http.ResponseWriter, r *http.Request) {
 			"payload":   logPayload,
 		})
 
+		session.wsMu.Lock()
+		if session.isDslRunning {
+			session.lastLogs = append(session.lastLogs, message)
+		}
+		session.wsMu.Unlock()
+
 		select {
 		case session.broadcast <- message:
 		default:
@@ -94,6 +103,12 @@ func create(w http.ResponseWriter, r *http.Request) {
 			"sessionId": session.ID,
 			"payload":   rawResponse,
 		})
+
+		session.wsMu.Lock()
+		if session.isDslRunning {
+			session.lastLogs = append(session.lastLogs, message)
+		}
+		session.wsMu.Unlock()
 
 		select {
 		case session.broadcast <- message:
@@ -146,15 +161,18 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type      string      `json:"type"`                // 操作类型: navigate, input, click, select, wait, wait_selector, eval, keypress
-	URL       string      `json:"url,omitempty"`       // navigate 的参数
-	Selector  string      `json:"selector,omitempty"`  // CSS 选择器
-	Value     string      `json:"value,omitempty"`     // 填入的值
-	Ms        int         `json:"ms,omitempty"`        // 等待毫秒数
-	Script    string      `json:"script,omitempty"`    // 要执行的自定义 JS
-	Condition string      `json:"condition,omitempty"` // if 的判断条件 (JS 表达式)
-	Then      []DSLAction `json:"then,omitempty"`      // 条件为真时执行的动作
-	Else      []DSLAction `json:"else,omitempty"`      // 条件为假时执行的动作
+	Type         string      `json:"type"`                   // 操作类型: navigate, input, click, select, wait, wait_selector, eval, keypress, wait_for_input
+	URL          string      `json:"url,omitempty"`          // navigate 的参数
+	Selector     string      `json:"selector,omitempty"`     // CSS 选择器
+	Value        string      `json:"value,omitempty"`        // 填入的值
+	Ms           int         `json:"ms,omitempty"`           // 等待毫秒数
+	Script       string      `json:"script,omitempty"`       // 要执行的自定义 JS
+	Condition    string      `json:"condition,omitempty"`    // if 的判断条件 (JS 表达式)
+	Then         []DSLAction `json:"then,omitempty"`         // 条件为真时执行的动作
+	Else         []DSLAction `json:"else,omitempty"`         // 条件为假时执行的动作
+	InputType    string      `json:"inputType,omitempty"`    // wait_for_input 的类型, e.g., "prompt"
+	Prompt       string      `json:"prompt,omitempty"`       // wait_for_input 的提示信息
+	VariableName string      `json:"variableName,omitempty"` // wait_for_input 存储用户输入的变量名
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +191,12 @@ func runDSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 清理旧日志，并标记 DSL 开始执行
+	s.wsMu.Lock()
+	s.isDslRunning = true
+	s.lastLogs = nil
+	s.wsMu.Unlock()
+
 	var actions []DSLAction
 	if err := json.NewDecoder(r.Body).Decode(&actions); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -187,14 +211,46 @@ func runDSL(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		s.wsMu.Lock()
+		s.isDslRunning = false
 		s.cancelDSL = nil
 		s.wsMu.Unlock()
 		cancel()
 	}()
 
-	executeDSLActions(ctx, s, actions)
+	variables := make(map[string]string)
+	executeDSLActions(ctx, s, actions, variables)
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func userInput(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	mu.Lock()
+	s, ok := sessions[id]
+	mu.Unlock()
+
+	if !ok {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusInternalServerError)
+		return
+	}
+
+	select {
+	case s.userInputChan <- string(body):
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	default:
+		http.Error(w, "Not waiting for input", http.StatusConflict)
+	}
 }
 
 func stopDSL(w http.ResponseWriter, r *http.Request) {
@@ -213,17 +269,40 @@ func stopDSL(w http.ResponseWriter, r *http.Request) {
 		if s.cancelDSL != nil {
 			s.cancelDSL() // 发送取消信号
 		}
+		// 发送消息以确保前端交互UI被清理
+		finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+		s.broadcast <- finishMsg
 		s.wsMu.Unlock()
 	}
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
-func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction) {
+var varRegex = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}`)
+
+func substituteVariables(text string, variables map[string]string) string {
+	return varRegex.ReplaceAllStringFunc(text, func(match string) string {
+		key := match[2 : len(match)-2]
+		if val, ok := variables[key]; ok {
+			return val
+		}
+		return match // Return original if not found
+	})
+}
+
+func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, variables map[string]string) {
 	for _, action := range actions {
 		// 每次执行指令前检查是否收到了终止信号
 		if ctx.Err() != nil {
 			return
 		}
+
+		// 替换所有可能包含变量的字段
+		action.URL = substituteVariables(action.URL, variables)
+		action.Selector = substituteVariables(action.Selector, variables)
+		action.Value = substituteVariables(action.Value, variables)
+		action.Script = substituteVariables(action.Script, variables)
+		action.Condition = substituteVariables(action.Condition, variables)
+		action.Prompt = substituteVariables(action.Prompt, variables)
 
 		switch action.Type {
 		case "navigate":
@@ -338,12 +417,37 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction) {
 				fmt.Println("raw", raw)
 				json.Unmarshal(raw, &res)
 				if res.Result.Value {
-					executeDSLActions(ctx, s, action.Then)
+					executeDSLActions(ctx, s, action.Then, variables)
 				} else {
-					executeDSLActions(ctx, s, action.Else)
+					executeDSLActions(ctx, s, action.Else, variables)
 				}
 			} else {
 				fmt.Println("if err", err)
+			}
+			// 		}
+			// 	}
+			// }
+		case "wait_for_input":
+			if action.InputType == "prompt" {
+				interactionPayload := map[string]interface{}{
+					"type":    "user_interaction_required",
+					"payload": map[string]string{"inputType": "prompt", "prompt": action.Prompt},
+				}
+				msg, _ := json.Marshal(interactionPayload)
+				s.broadcast <- msg
+
+				select {
+				case userInput := <-s.userInputChan:
+					if action.VariableName != "" {
+						variables[action.VariableName] = userInput
+					}
+					finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+					s.broadcast <- finishMsg
+				case <-ctx.Done():
+					finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+					s.broadcast <- finishMsg
+					return
+				}
 			}
 		}
 	}
@@ -376,6 +480,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	s.wsMu.Lock()
 	lastFrame := s.lastFrame
+	lastLogs := s.lastLogs
 	s.wsMu.Unlock()
 
 	if lastFrame != "" {
@@ -387,6 +492,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 			conn.Close()
 			return
+		}
+	}
+
+	// 如果有缓存的日志，也一并发送给新连接的前端
+	if len(lastLogs) > 0 {
+		for _, logMsg := range lastLogs {
+			if err := conn.WriteMessage(websocket.TextMessage, logMsg); err != nil {
+				conn.Close()
+				return
+			}
 		}
 	}
 
@@ -643,7 +758,7 @@ func runCronDSL(dslID int) {
 	session.cancelDSL = cancel
 	session.wsMu.Unlock()
 
-	executeDSLActions(ctx, session, actions)
+	executeDSLActions(ctx, session, actions, make(map[string]string))
 }
 
 // --- CRUD ---

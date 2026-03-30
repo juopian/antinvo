@@ -40,6 +40,7 @@ func main() {
 	http.HandleFunc("/list", listSessions)
 	http.HandleFunc("/run_dsl", runDSL)
 	http.HandleFunc("/stop_dsl", stopDSL)
+	http.HandleFunc("/user_input", userInput)
 	http.HandleFunc("/api/dsl/list", authMiddleware(apiListDSL))
 	http.HandleFunc("/api/dsl/save", authMiddleware(apiSaveDSL))
 	http.HandleFunc("/api/dsl/delete", authMiddleware(apiDeleteDSL))

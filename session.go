@@ -11,15 +11,18 @@ import (
 )
 
 type Session struct {
-	ID          string
-	Client      *Client
-	Cmd         *exec.Cmd
-	UserDataDir string
-	WS          map[*websocket.Conn]bool
-	wsMu        sync.Mutex
-	lastFrame   string
-	cancelDSL   context.CancelFunc
-	broadcast   chan []byte
+	ID            string
+	Client        *Client
+	Cmd           *exec.Cmd
+	UserDataDir   string
+	WS            map[*websocket.Conn]bool
+	wsMu          sync.Mutex
+	lastFrame     string
+	lastLogs      [][]byte
+	isDslRunning  bool
+	userInputChan chan string
+	cancelDSL     context.CancelFunc
+	broadcast     chan []byte
 }
 
 var sessions = map[string]*Session{}
