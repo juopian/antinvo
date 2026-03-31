@@ -17,9 +17,11 @@ var userSessions sync.Map
 func main() {
 	const port = ":8080"
 
-	initDB()            // 初始化DSL
-	go runGlobalWsHub() // 启动全局事件广播 Hub
-	initCronTasks()     // 初始化定时任务表并启动活跃任务
+	initDB()                // 初始化数据库表
+	loadUserSessions()      // 从数据库加载用户会话
+	initPersistentDirPool() // 初始化持久化目录池
+	go runGlobalWsHub()     // 启动全局事件广播 Hub
+	initCronTasks()         // 初始化定时任务表并启动活跃任务
 
 	var err error
 	chromeExecutablePath, err = getChromePath()

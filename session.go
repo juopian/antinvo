@@ -12,6 +12,7 @@ import (
 
 type Session struct {
 	ID            string
+	IsPersistent  bool
 	Client        *Client
 	Cmd           *exec.Cmd
 	UserDataDir   string
@@ -42,9 +43,19 @@ func deleteSession(id string) {
 		}
 
 		// Delete user data directory
-		if s.UserDataDir != "" {
-			os.RemoveAll(s.UserDataDir)
-			log.Printf("已删除临时数据目录: %s", s.UserDataDir)
+		if s.UserDataDir != "" { // s.UserDataDir will be an empty string if chrome fails to start
+			if s.IsPersistent {
+				// For persistent sessions, return the directory to the pool
+				select {
+				case persistentDirPool <- s.UserDataDir:
+					log.Printf("已释放持久化数据目录到池中: %s", s.UserDataDir)
+				default:
+					log.Printf("持久化目录池已满，未释放: %s", s.UserDataDir)
+				}
+			} else {
+				os.RemoveAll(s.UserDataDir)
+				log.Printf("已删除临时数据目录: %s", s.UserDataDir)
+			}
 		}
 
 		s.wsMu.Lock()

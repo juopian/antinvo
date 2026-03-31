@@ -39,4 +39,17 @@ func initDB() {
 	if err != nil {
 		log.Fatalf("创建数据库表失败: %q", err)
 	}
+
+	// 新增：创建用户会话表
+	sessionTableStmt := `
+	CREATE TABLE IF NOT EXISTS user_sessions (
+		session_id TEXT PRIMARY KEY,
+		user_info TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+	_, err = db.Exec(sessionTableStmt)
+	if err != nil {
+		log.Fatalf("创建用户会话表失败: %q", err)
+	}
 }

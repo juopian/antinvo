@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,11 +22,29 @@ func create(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	id := fmt.Sprintf("%d", time.Now().UnixNano())
+	isPersistent := r.URL.Query().Get("persistent") == "true"
+	var userDataDir string
+	var id string
+
+	if isPersistent {
+		select {
+		case dir := <-persistentDirPool:
+			userDataDir = dir
+			log.Printf("从池中复用持久化目录: %s", userDataDir)
+		default:
+			// Pool is empty, create a new directory for a persistent session
+			userDataDir = filepath.Join(persistentDataPath, fmt.Sprintf("session-%d", time.Now().UnixNano()))
+			log.Printf("池为空，新建持久化目录: %s", userDataDir)
+		}
+		id = filepath.Base(userDataDir) // Use directory name as ID for simplicity
+	} else {
+		id = fmt.Sprintf("temp-%d", time.Now().UnixNano())
+		userDataDir = filepath.Join(os.TempDir(), "chrome-"+id)
+	}
+
 	port := nextPort
 	nextPort++
 
-	userDataDir := filepath.Join(os.TempDir(), "chrome-"+id)
 	cmd := launchChrome(chromeExecutablePath, port, userDataDir)
 	wsURL, err := getWSURL(port)
 	if err != nil {
@@ -48,6 +67,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 	session := &Session{
 		ID:            id,
+		IsPersistent:  isPersistent,
 		Client:        client,
 		Cmd:           cmd,
 		UserDataDir:   userDataDir,
@@ -161,18 +181,20 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type         string      `json:"type"`                   // 操作类型: navigate, input, click, select, wait, wait_selector, eval, keypress, wait_for_input
-	URL          string      `json:"url,omitempty"`          // navigate 的参数
-	Selector     string      `json:"selector,omitempty"`     // CSS 选择器
-	Value        string      `json:"value,omitempty"`        // 填入的值
-	Ms           int         `json:"ms,omitempty"`           // 等待毫秒数
-	Script       string      `json:"script,omitempty"`       // 要执行的自定义 JS
-	Condition    string      `json:"condition,omitempty"`    // if 的判断条件 (JS 表达式)
-	Then         []DSLAction `json:"then,omitempty"`         // 条件为真时执行的动作
-	Else         []DSLAction `json:"else,omitempty"`         // 条件为假时执行的动作
-	InputType    string      `json:"inputType,omitempty"`    // wait_for_input 的类型, e.g., "prompt"
-	Prompt       string      `json:"prompt,omitempty"`       // wait_for_input 的提示信息
-	VariableName string      `json:"variableName,omitempty"` // wait_for_input 存储用户输入的变量名
+	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan
+	URL             string      `json:"url,omitempty"`             // navigate 的参数
+	Selector        string      `json:"selector,omitempty"`        // CSS 选择器
+	Value           string      `json:"value,omitempty"`           // 填入的值
+	Ms              int         `json:"ms,omitempty"`              // 等待毫秒数
+	Timeout         int         `json:"timeout,omitempty"`         // 通用超时时间(秒), e.g. for wait_selector, wait_for_qrcode_scan
+	Script          string      `json:"script,omitempty"`          // 要执行的自定义 JS
+	Condition       string      `json:"condition,omitempty"`       // if 的判断条件 (JS 表达式)
+	Then            []DSLAction `json:"then,omitempty"`            // 条件为真时执行的动作
+	Else            []DSLAction `json:"else,omitempty"`            // 条件为假时执行的动作
+	InputType       string      `json:"inputType,omitempty"`       // wait_for_input 的类型, e.g., "prompt"
+	Prompt          string      `json:"prompt,omitempty"`          // wait_for_input 的提示信息
+	VariableName    string      `json:"variableName,omitempty"`    // wait_for_input 存储用户输入的变量名
+	SuccessSelector string      `json:"successSelector,omitempty"` // wait_for_qrcode_scan 的成功标识元素
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -277,6 +299,40 @@ func stopDSL(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "stopped"})
 }
 
+func pollForSuccess(ctx context.Context, s *Session, expression string, timeout time.Duration) error {
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		// Check for cancellation at the start of each iteration
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("polling timed out or was cancelled")
+		default:
+		}
+
+		raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expression})
+		if err == nil {
+			var res struct {
+				Result struct {
+					Value bool `json:"value"`
+				} `json:"result"`
+			}
+			json.Unmarshal(raw, &res)
+			if res.Result.Value {
+				return nil // Success
+			}
+		}
+
+		// Wait before next poll
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-pollCtx.Done():
+			return fmt.Errorf("polling timed out or was cancelled during wait")
+		}
+	}
+}
+
 var varRegex = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}`)
 
 func substituteVariables(text string, variables map[string]string) string {
@@ -303,6 +359,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		action.Script = substituteVariables(action.Script, variables)
 		action.Condition = substituteVariables(action.Condition, variables)
 		action.Prompt = substituteVariables(action.Prompt, variables)
+		action.SuccessSelector = substituteVariables(action.SuccessSelector, variables)
 
 		switch action.Type {
 		case "navigate":
@@ -335,6 +392,22 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			time.Sleep(500 * time.Millisecond)
 		case "input":
 			expr := fmt.Sprintf("document.querySelector(`%s`).value = `%s`", action.Selector, action.Value)
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+		case "checkbox":
+			shouldBeChecked := "false"
+			if action.Value == "true" {
+				shouldBeChecked = "true"
+			}
+			// This JS ensures a checkbox is in a specific state (checked or unchecked).
+			// It finds the element and if its `checked` state is not the desired one, it clicks it.
+			// Clicking is more robust than setting `element.checked` as it triggers events.
+			expr := fmt.Sprintf("const el = document.querySelector(`%s`); if (el && el.checked !== %s) { el.click(); }", action.Selector, shouldBeChecked)
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+		case "radio":
+			// This JS is for selecting a radio button.
+			// It iterates through elements found by `selector` (e.g., a radio group)
+			// and clicks the one whose `value` attribute matches the `value` from the action.
+			expr := fmt.Sprintf("const radios = document.querySelectorAll(`%s`); for (const radio of radios) { if (radio.value === `%s`) { if (!radio.checked) { radio.click(); } break; } }", action.Selector, action.Value)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
 		case "click":
 			expr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
@@ -382,29 +455,14 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Script})
 		case "wait_selector":
 			// 轮询等待元素出现（最多等待 10 秒）
+			timeout := 10 * time.Second
+			if action.Timeout > 0 {
+				timeout = time.Duration(action.Timeout) * time.Second
+			}
 			expr := fmt.Sprintf("!!document.querySelector(`%s`)", action.Selector)
-			for j := 0; j < 50; j++ {
-				if ctx.Err() != nil {
-					return
-				}
-
-				raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
-				if err == nil {
-					var res struct {
-						Result struct {
-							Value bool `json:"value"`
-						} `json:"result"`
-					}
-					json.Unmarshal(raw, &res)
-					if res.Result.Value {
-						break // 元素出现了，跳出等待循环
-					}
-				}
-				select {
-				case <-time.After(200 * time.Millisecond):
-				case <-ctx.Done():
-					return
-				}
+			err := pollForSuccess(ctx, s, expr, timeout)
+			if err != nil {
+				log.Printf("Session %s: wait_selector for '%s' failed: %v", s.ID, action.Selector, err)
 			}
 		case "if":
 			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Condition})
@@ -424,9 +482,6 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			} else {
 				fmt.Println("if err", err)
 			}
-			// 		}
-			// 	}
-			// }
 		case "wait_for_input":
 			if action.InputType == "prompt" {
 				interactionPayload := map[string]interface{}{
@@ -448,6 +503,76 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 					s.broadcast <- finishMsg
 					return
 				}
+			}
+		case "wait_for_qrcode_scan":
+			// 1. 提取二维码的 src 或 data URL
+			getQrCodeExpr := fmt.Sprintf(`
+				(() => {
+					const el = document.querySelector('%s');
+					if (!el) return null;
+					if (el.tagName.toLowerCase() === 'img') return el.src;
+					if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
+					const svg = el.querySelector('svg');
+					if (svg) {
+						const xml = new XMLSerializer().serializeToString(svg);
+						return 'data:image/svg+xml;base64,' + window.btoa(xml);
+					}
+					return null; 
+				})()
+			`, action.Selector)
+
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getQrCodeExpr, "returnByValue": true})
+			if err != nil {
+				log.Printf("Session %s: 获取二维码失败: %v", s.ID, err)
+				return
+			}
+
+			var res struct {
+				Result struct {
+					Value string `json:"value"`
+				} `json:"result"`
+			}
+			json.Unmarshal(raw, &res)
+			qrCodeData := res.Result.Value
+
+			if qrCodeData == "" {
+				log.Printf("Session %s: 未找到二维码元素或元素内容为空 (%s)", s.ID, action.Selector)
+				return
+			}
+
+			// 2. 将二维码广播到前端
+			prompt := "请使用手机扫码登录"
+			if action.Prompt != "" {
+				prompt = action.Prompt
+			}
+			interactionPayload := map[string]interface{}{
+				"type": "user_interaction_required",
+				"payload": map[string]string{
+					"inputType":  "qrcode",
+					"qrCodeData": qrCodeData,
+					"prompt":     prompt,
+				},
+			}
+			msg, _ := json.Marshal(interactionPayload)
+			s.broadcast <- msg
+
+			// 3. 等待扫描完成 (通过轮询成功标识元素)
+			timeout := 60 // 默认超时60秒
+			if action.Timeout > 0 {
+				timeout = action.Timeout
+			}
+			successPollExpr := fmt.Sprintf("!!document.querySelector(`%s`)", action.SuccessSelector)
+			log.Printf("Session %s: 等待扫码登录, 轮询目标元素: %s", s.ID, action.SuccessSelector)
+			err = pollForSuccess(ctx, s, successPollExpr, time.Duration(timeout)*time.Second)
+
+			// 4. 通知前端交互结束
+			finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+			s.broadcast <- finishMsg
+
+			if err != nil {
+				log.Printf("Session %s: 等待扫码结果时出错: %v", s.ID, err)
+			} else {
+				log.Printf("Session %s: 扫码成功, 找到目标元素.", s.ID)
 			}
 		}
 	}

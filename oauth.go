@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -143,8 +144,22 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 生成 session ID 并保存用户信息到内存 Session 中
+	// 生成 session ID 并保存用户信息到内存和数据库
 	sessionID := generateRandomString(32)
+
+	userInfoJSON, err := json.Marshal(userResp.UserInfo)
+	if err != nil {
+		http.Error(w, "无法序列化用户信息", http.StatusInternalServerError)
+		return
+	}
+
+	// 持久化到数据库
+	_, err = db.Exec("INSERT INTO user_sessions (session_id, user_info) VALUES (?, ?)", sessionID, string(userInfoJSON))
+	if err != nil {
+		log.Printf("保存用户会话到数据库失败: %v", err)
+		http.Error(w, "无法保存会话", http.StatusInternalServerError)
+		return
+	}
 	userSessions.Store(sessionID, userResp.UserInfo)
 
 	http.SetCookie(w, &http.Cookie{
@@ -208,7 +223,14 @@ func userInfoHandler(w http.ResponseWriter, r *http.Request) {
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	cookie, err := r.Cookie("session_id")
 	if err == nil {
-		userSessions.Delete(cookie.Value) // 从内存中清除 Session
+		sessionID := cookie.Value
+		userSessions.Delete(sessionID) // 从内存中清除 Session
+
+		// 从数据库中清除 Session
+		_, err := db.Exec("DELETE FROM user_sessions WHERE session_id = ?", sessionID)
+		if err != nil {
+			log.Printf("从数据库删除会话失败: %v", err)
+		}
 	}
 
 	// 清除客户端 Cookie
@@ -221,4 +243,33 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// loadUserSessions 从数据库加载所有用户会话到内存中
+func loadUserSessions() {
+	rows, err := db.Query("SELECT session_id, user_info FROM user_sessions")
+	if err != nil {
+		log.Printf("启动时加载用户会话失败: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var sessionID string
+		var userInfoJSON string
+		if err := rows.Scan(&sessionID, &userInfoJSON); err != nil {
+			log.Printf("扫描会话行失败: %v", err)
+			continue
+		}
+
+		var userInfo UserInfo
+		if err := json.Unmarshal([]byte(userInfoJSON), &userInfo); err != nil {
+			log.Printf("解析会话中的用户信息失败: %v", err)
+			continue
+		}
+		userSessions.Store(sessionID, userInfo)
+		count++
+	}
+	log.Printf("从数据库加载了 %d 个用户会话。", count)
 }

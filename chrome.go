@@ -13,15 +13,10 @@ import (
 func getChromePath() (string, error) {
 	var paths []string
 	switch runtime.GOOS {
+	case "linux": // Add common paths for Docker containers
+		paths = []string{"/usr/bin/google-chrome", "/usr/bin/chromium-browser", "/usr/bin/chrome", "/opt/google/chrome/chrome", "/usr/bin/google-chrome-stable"}
 	case "darwin":
 		paths = []string{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
-	case "linux":
-		paths = []string{
-			"/usr/bin/google-chrome",
-			"/usr/bin/google-chrome-stable",
-			"/usr/bin/chromium-browser",
-			"/snap/bin/chromium",
-		}
 	case "windows":
 		paths = []string{
 			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -30,6 +25,11 @@ func getChromePath() (string, error) {
 		}
 	default:
 		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+
+	// Check if CHROME_PATH environment variable is set (useful for Docker or custom setups)
+	if envPath := os.Getenv("CHROME_PATH"); envPath != "" {
+		paths = append([]string{envPath}, paths...)
 	}
 
 	for _, path := range paths {
@@ -48,6 +48,9 @@ func launchChrome(chromePath string, port int, dir string) *exec.Cmd {
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		fmt.Sprintf("--user-data-dir=%s", dir),
 		"--headless=new",
+		"--window-size=1500,1000", // 设置窗口尺寸以匹配前端卡片6:4的宽高比，避免滚动条
+		"--hide-scrollbars",       // 强制隐藏滚动条
+		"--disable-gpu",           // 在无头模式下通常建议禁用 GPU 以提高稳定性
 		"--no-first-run",
 		"--no-default-browser-check",
 	)

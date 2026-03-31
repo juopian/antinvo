@@ -9,7 +9,8 @@
 
 <body>
   <div class="toolbar" style="display: flex; align-items: center;">
-    <button class="primary" onclick="create()">➕ 新建浏览器</button>
+    <button class="primary" onclick="create(false)">🌟 新建浏览器</button>
+    <button class="primary" onclick="create(true)" style="margin-left: 10px;">✨ 新建持久化浏览器</button>
     <button id="dslBtn" onclick="openDslModal()" style="display: none;">⚙️ DSL 管理</button>
     <button id="cronBtn" onclick="openCronModal()" style="margin-left: 10px; display: none;">⏱️ 定时任务</button>
     <div
@@ -17,6 +18,11 @@
       <span>浏览器总数: <span id="totalCount">0</span></span>
       <span style="margin: 0 10px; color: #ccc;">|</span>
       <span>运行中: <span id="runningCount" style="color: orange;">0</span></span>
+    </div>
+    <div class="layout-switcher" style="margin-right: 16px; display: flex; align-items: center; gap: 5px; font-size: 14px;">
+      <button onclick="changeColumns(2, this)">2列</button>
+      <button onclick="changeColumns(3, this)">3列</button>
+      <button class="active" onclick="changeColumns(5, this)">5列</button>
     </div>
     <div id="userMenu" style="margin-right: 16px; display: flex; align-items: center; gap: 10px;">
       <button id="loginBtn" onclick="window.location.href='/login'">登陆</button>
@@ -86,10 +92,11 @@
   </div>
 
   <!-- 引入 Ace Editor 以提供良好的 JSON 编辑体验 -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.6/ace.js"></script>
+  <script src="ace.js"></script>
   <script src="utils.js"></script>
   <script src="dsl.js"></script>
   <script src="cron.js"></script>
+  <script src="layout.js"></script>
   <script src="session.js"></script>
   <script src="main.js"></script>
 

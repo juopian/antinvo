@@ -66,17 +66,15 @@ GOOS=windows GOARCH=amd64 go build -o antinvo-windows.exe .
    - **点击元素**：在“CSS选择器”框输入目标按钮的选择器（如 `#su`），点击 **“点击元素”**。
    - **选择Option**：在“CSS选择器”框输入 `<select>` 的选择器，在“Option Value”框输入目标 `<option>` 的 value 值，点击 **“选择Option”**。
 
-## 接口列表 (API Endpoints)
+### build image 
 
-- `POST /create`: 创建新的浏览器会话
-- `GET /list`: 获取当前所有活跃的会话 ID
-- `GET /navigate?id={id}&url={url}`: 控制指定会话跳转 URL
-- `GET /click?id={id}&selector={selector}`: 点击指定元素
-- `GET /input?id={id}&selector={selector}&value={value}`: 在指定元素填入内容
-- `GET /selectOption?id={id}&selector={selector}&value={value}`: 选择下拉框选项
-- `GET /delete?id={id}`: 销毁指定会话及浏览器进程
-- `WS /ws?sessionId={id}`: 接收屏幕截图广播帧
+docker build --platform=linux/amd64 -t antinvo-go:latest .
 
+docker run -p 8081:8080 \
+  --platform=linux/amd64 \
+  -e OAUTH2_AUTH_ENDPOINT="YOUR_AUTH_ENDPOINT" \
+  -e OAUTH2_USERINFO_ENDPOINT="YOUR_USERINFO_ENDPOINT" \
+  antinvo-go:latest
 
 ### sample DSL
 

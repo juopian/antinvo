@@ -1,5 +1,5 @@
-function create() {
-  fetch('/create', { method: 'POST' })
+function create(isPersistent) {
+  fetch(`/create?persistent=${isPersistent}`, { method: 'POST' })
     .then(r => r.json())
     .then(d => add(d.sessionId));
 }
@@ -220,9 +220,7 @@ function add(id, initIsRunning = false) {
     } else if (message.type === 'user_interaction_required') {
       handleInteraction(card, message.payload);
     } else if (message.type === 'user_interaction_finished') {
-      const interactionPanel = card.querySelector('.interaction-panel');
-      interactionPanel.style.display = 'none';
-      interactionPanel.innerHTML = '';
+      handleInteractionEnd(card);
     }
   };
 
@@ -230,38 +228,66 @@ function add(id, initIsRunning = false) {
 }
 
 function handleInteraction(card, payload) {
+  if (payload.inputType === 'prompt') {
     const interactionPanel = card.querySelector('.interaction-panel');
     interactionPanel.innerHTML = ''; // Clear previous content
 
-    if (payload.inputType === 'prompt') {
-        const promptText = document.createElement('p');
-        promptText.innerText = payload.prompt;
+    const promptText = document.createElement('p');
+    promptText.innerText = payload.prompt;
 
-        const input = document.createElement('input');
-        input.type = 'text';
-        input.placeholder = '请输入...';
-        input.onkeydown = (e) => {
-            if (e.key === 'Enter') {
-                submitBtn.click();
-            }
-        };
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '请输入...';
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        submitBtn.click();
+      }
+    };
 
-        const submitBtn = document.createElement('button');
-        submitBtn.innerText = '提交';
-        submitBtn.onclick = () => {
-            const sessionId = card.dataset.sessionId;
-            const value = input.value;
-            fetch(`/user_input?id=${sessionId}`, { method: 'POST', body: value })
-                .then(res => {
-                    if (!res.ok) alert('提交失败或任务已超时');
-                });
-        };
+    const submitBtn = document.createElement('button');
+    submitBtn.innerText = '提交';
+    submitBtn.onclick = () => {
+      const sessionId = card.dataset.sessionId;
+      const value = input.value;
+      fetch(`/user_input?id=${sessionId}`, { method: 'POST', body: value })
+        .then(res => {
+          if (!res.ok) alert('提交失败或任务已超时');
+        });
+    };
 
-        interactionPanel.appendChild(promptText);
-        interactionPanel.appendChild(input);
-        interactionPanel.appendChild(submitBtn);
-    }
+    interactionPanel.appendChild(promptText);
+    interactionPanel.appendChild(input);
+    interactionPanel.appendChild(submitBtn);
     interactionPanel.style.display = 'flex';
+  } else if (payload.inputType === 'qrcode') {
+    let overlay = card.querySelector('.interaction-overlay');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'interaction-overlay';
+      if (getComputedStyle(card).position === 'static') {
+        card.style.position = 'relative';
+      }
+      card.appendChild(overlay);
+    }
+    overlay.innerHTML = `
+        <img src="${payload.qrCodeData}" class="qr-code" alt="QR Code">
+        <p class="prompt-text">${payload.prompt}</p>
+    `;
+    overlay.classList.add('active');
+  }
+}
+
+function handleInteractionEnd(card) {
+  const interactionPanel = card.querySelector('.interaction-panel');
+  if (interactionPanel) {
+    interactionPanel.style.display = 'none';
+    interactionPanel.innerHTML = '';
+  }
+  const overlay = card.querySelector('.interaction-overlay');
+  if (overlay) {
+    overlay.classList.remove('active');
+    overlay.innerHTML = '';
+  }
 }
 
 async function restoreSessions() {
