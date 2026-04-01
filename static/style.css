@@ -407,12 +407,17 @@ body {
   background: #1890ff;
 }
 
+.icon-btn.btn-qrcode:hover {
+  background: #6f42c1;
+  /* 一个紫色系的颜色 */
+}
+
+.icon-btn.btn-input:hover {
+  background: #28a745;
+}
+
 /* 确保执行按钮居中 */
 .btn-exec {
-  position: absolute !important;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
   z-index: 10;
 }
 
@@ -534,4 +539,20 @@ body {
 .interaction-overlay .prompt-text {
   font-weight: bold;
   color: #333;
+}
+
+.error-display {
+  position: absolute;
+  bottom: 20%;
+  left: 0;
+  right: 0;
+  color: #D14;
+  /* A reddish color */
+  font-size: 12px;
+  text-align: center;
+  display: none;
+  /* Hidden by default */
+  width: 100%;
+  padding: 0 10px;
+  box-sizing: border-box;
 }

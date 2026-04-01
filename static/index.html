@@ -9,10 +9,12 @@
 
 <body>
   <div class="toolbar" style="display: flex; align-items: center;">
-    <button class="primary" onclick="create(false)">🌟 新建浏览器</button>
-    <button class="primary" onclick="create(true)" style="margin-left: 10px;">✨ 新建持久化浏览器</button>
-    <button id="dslBtn" onclick="openDslModal()" style="display: none;">⚙️ DSL 管理</button>
+    <button class="primary" onclick="create(false)">✨ 新建浏览器</button>
+    <button class="primary" onclick="create(true)" style="margin-left: 10px;">🌟 新建持久化浏览器</button>
+    <button id="dslBtn" onclick="openDslModal()" style="margin-left: 10px; display: none;">⚙️ DSL 管理</button>
+    <button id="batchDslBtn" onclick="openBatchDslModal()" style="margin-left: 10px; display: none;">📦 批量 DSL 管理</button>
     <button id="cronBtn" onclick="openCronModal()" style="margin-left: 10px; display: none;">⏱️ 定时任务</button>
+    <button id="secretsBtn" onclick="openSecretsModal()" style="margin-left: 10px; display: none;">🔑 密码保险箱</button>
     <div
       style="flex: 1;font-size: 14px; font-weight: bold; display: flex; align-items: center; justify-content: center;">
       <span>浏览器总数: <span id="totalCount">0</span></span>
@@ -25,7 +27,7 @@
       <button class="active" onclick="changeColumns(5, this)">5列</button>
     </div>
     <div id="userMenu" style="margin-right: 16px; display: flex; align-items: center; gap: 10px;">
-      <button id="loginBtn" onclick="window.location.href='/login'">登陆</button>
+      <button id="loginBtn" onclick="window.location.href='/login'" style="padding: 4px 12px;">登陆</button>
     </div>
   </div>
 
@@ -91,11 +93,87 @@
     </div>
   </div>
 
+  <!-- 密码保险箱 模态框 -->
+  <div class="modal-overlay" id="secretsModal" style="display:none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>🔑 密码保险箱</h2>
+        <button class="close-modal" onclick="closeSecretsModal()">✖</button>
+      </div>
+      <div class="modal-body">
+        <div class="dsl-sidebar">
+          <button class="btn-new" onclick="createNewSecret()">➕ 新建密码</button>
+          <div id="secretsList"></div>
+        </div>
+        <div class="dsl-main">
+          <input type="hidden" id="editSecretNameHidden" value="">
+          <input type="text" id="editSecretName" placeholder="密码名称 (Key)" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+          <input type="text" id="editSecretDescription" placeholder="说明 (可选)" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+          <input type="password" id="editSecretValue" placeholder="密码值 (Value)" style="margin-bottom: 10px; width: 100%; box-sizing: border-box; padding: 8px;">
+          <div class="dsl-actions">
+            <button class="btn-del" id="btnDelSecret" onclick="deleteCurrentSecret()" style="display:none;">删除</button>
+            <button class="btn-save" onclick="saveCurrentSecret()">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量DSL管理 模态框 -->
+  <div class="modal-overlay" id="batchDslModal" style="display:none;">
+    <div class="modal-content" style="width: 1000px; max-width: 90vw;">
+      <div class="modal-header">
+        <h2>📦 批量 DSL 管理</h2>
+        <button class="close-modal" onclick="closeBatchDslModal()">✖</button>
+      </div>
+      <div class="modal-body" style="display: flex; flex-direction: column; max-height: 80vh;">
+        <div class="batch-dsl-create" style="padding-bottom: 20px; border-bottom: 1px solid #ccc;">
+          <h4>一键生成 DSL 脚本</h4>
+          <p style="font-size: 12px; color: #666;">选择一个数据文件 (如 CSV) 和一个 DSL 模板，我们将为文件中的每一行数据生成一个对应的 DSL 脚本。</p>
+          <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+            <label for="batchDslTemplateSelect">DSL 模板:</label>
+            <select id="batchDslTemplateSelect" style="flex: 1; padding: 8px;">
+              <option value="">-- 请选择 DSL 模板 --</option>
+            </select>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+            <label for="batchDslDataFileInput">数据文件:</label>
+            <input type="file" id="batchDslDataFileInput" style="flex: 1;">
+            <button class="primary" onclick="generateDslFromTemplate()">🚀 开始生成</button>
+          </div>
+        </div>
+        <div style="display: flex; flex: 1; min-height: 0; margin-top: 10px; gap: 10px;">
+          <div class="dsl-sidebar" style="width: 300px; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding-bottom: 10px;">
+              <h4>生成的 DSL 脚本列表</h4>
+              <div>
+                <button class="btn-del" id="deleteSelectedDslsBtn" onclick="deleteSelectedDsls()" style="display: none;">删除选中</button>
+                <button class="btn-save" id="saveAllBatchDslsBtn" onclick="saveAllBatchGeneratedDsls()" style="display: none;">全部保存</button>
+              </div>
+            </div>
+            <div id="batchDslListContainer" style="flex: 1; overflow-y: auto; border: 1px solid #ccc; border-radius: 4px;"></div>
+          </div>
+          <div class="dsl-main" id="batchDslPreviewContainer" style="flex: 1; display: none;">
+            <input type="hidden" id="currentBatchDslIndex" value="-1">
+            <input type="text" id="batchDslPreviewName" placeholder="输入 DSL 脚本名称">
+            <div id="batchDslPreviewEditor" style="flex: 1; min-height: 0; width: 100%; border: 1px solid #ccc; border-radius: 4px; margin: 10px 0;"></div>
+            <div class="dsl-actions">
+              <button class="btn-format" id="btnFormatBatchDsl" onclick="formatBatchDslJson()">✨ 格式化</button>
+              <button class="btn-save" id="btnSaveBatchDsl" onclick="saveCurrentBatchDsl()">保存此脚本</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 引入 Ace Editor 以提供良好的 JSON 编辑体验 -->
   <script src="ace.js"></script>
   <script src="utils.js"></script>
   <script src="dsl.js"></script>
   <script src="cron.js"></script>
+  <script src="secrets.js"></script>
+  <script src="dsl_bulk.js"></script>
   <script src="layout.js"></script>
   <script src="session.js"></script>
   <script src="main.js"></script>

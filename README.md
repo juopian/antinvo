@@ -12,7 +12,7 @@ Antinvo 是一个基于 Go 语言和 Chrome DevTools Protocol (CDP) 实现的远
 
 ## 环境要求 (Prerequisites)
 
-1. **Go 环境**：Go 1.16 或更高版本（本项目基于 Go 1.26.1）。
+1. **Go 环境**：Go 1.18 或更高版本（本项目基于 Go 1.22）。
 2. **Google Chrome**：运行该程序的宿主机上必须已安装 Google Chrome 浏览器。
 
 > **⚠️ 重要提示：跨平台运行前请修改 Chrome 路径**  

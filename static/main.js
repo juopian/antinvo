@@ -9,6 +9,16 @@ window.addEventListener('DOMContentLoaded', async () => {
     wrap: true
   });
 
+  // 初始化批量DSL管理模态框中的 DSL 预览编辑器
+  batchDslEditor = ace.edit("batchDslPreviewEditor");
+  batchDslEditor.setTheme("ace/theme/github");
+  batchDslEditor.session.setMode("ace/mode/json");
+  batchDslEditor.setOptions({
+    fontSize: "14px",
+    showPrintMargin: false,
+    wrap: true
+  });
+
   // 连接全局事件 WebSocket，用于接收会话创建/销毁的实时通知
   const eventWs = new WebSocket(`ws://${location.host}/ws/events`);
   eventWs.onmessage = (event) => {
@@ -39,9 +49,11 @@ window.addEventListener('DOMContentLoaded', async () => {
       const user = await userRes.json();
       const userMenu = document.getElementById('userMenu');
       userMenu.innerHTML = `<span style="font-size: 14px;">欢迎, ${user.full_name}</span>
-                            <button onclick="window.location.href='/logout'">登出</button>`;
+                            <button onclick="window.location.href='/logout'" style="padding: 4px 12px;">登出</button>`;
       document.getElementById('dslBtn').style.display = 'inline-block';
       document.getElementById('cronBtn').style.display = 'inline-block';
+      document.getElementById('secretsBtn').style.display = 'inline-block';
+      document.getElementById('batchDslBtn').style.display = 'inline-block';
     }
   } catch (e) {
     console.error("获取用户信息失败:", e);

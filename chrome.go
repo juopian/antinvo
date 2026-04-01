@@ -43,23 +43,32 @@ func getChromePath() (string, error) {
 }
 
 func launchChrome(chromePath string, port int, dir string) *exec.Cmd {
-	cmd := exec.Command(
-		chromePath,
+	args := []string{
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		fmt.Sprintf("--user-data-dir=%s", dir),
 		"--headless=new",
-		"--window-size=1500,1000", // 设置窗口尺寸以匹配前端卡片6:4的宽高比，避免滚动条
-		"--hide-scrollbars",       // 强制隐藏滚动条
-		"--disable-gpu",           // 在无头模式下通常建议禁用 GPU 以提高稳定性
+		"--window-size=1500,1000",     // 设置窗口尺寸以匹配前端卡片6:4的宽高比，避免滚动条
+		"--hide-scrollbars",           // 强制隐藏滚动条
+		"--disable-gpu",               // 在无头模式下通常建议禁用 GPU 以提高稳定性
+		"--ignore-certificate-errors", // 在某些企业代理环境下，这可能是必需的
 		"--no-first-run",
 		"--no-default-browser-check",
+	}
+	if proxyServer := os.Getenv("HTTP_PROXY"); proxyServer != "" {
+		args = append(args, fmt.Sprintf("--proxy-server=%s", proxyServer))
+	} else if proxyServer := os.Getenv("HTTPS_PROXY"); proxyServer != "" {
+		args = append(args, fmt.Sprintf("--proxy-server=%s", proxyServer))
+	}
+	cmd := exec.Command(
+		chromePath,
+		args...,
 	)
 	cmd.Start()
 	return cmd
 }
 
 func getWSURL(port int) (string, error) {
-	url := fmt.Sprintf("http://localhost:%d/json", port)
+	url := fmt.Sprintf("http://localhost:%d/json/list", port)
 	var resp *http.Response
 	var err error
 
@@ -90,4 +99,39 @@ func getWSURL(port int) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("未找到 webSocketDebuggerUrl")
+}
+
+func getWSURLForTarget(port int, targetId string) (string, error) {
+	url := fmt.Sprintf("http://localhost:%d/json/list", port)
+	var resp *http.Response
+	var err error
+
+	// It might take a moment for the new target to appear in the list
+	for i := 0; i < 20; i++ {
+		resp, err = http.Get(url)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		var pages []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&pages); err != nil {
+			resp.Body.Close()
+			return "", fmt.Errorf("解析 JSON 失败: %w", err)
+		}
+		resp.Body.Close()
+
+		for _, page := range pages {
+			if page["type"] == "page" {
+				if id, ok := page["id"].(string); ok && id == targetId {
+					if wsURL, ok := page["webSocketDebuggerUrl"].(string); ok {
+						return wsURL, nil
+					}
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return "", fmt.Errorf("未找到 targetId %s 的 webSocketDebuggerUrl", targetId)
 }

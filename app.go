@@ -4,6 +4,7 @@ import (
 	"embed"
 	"io/fs"
 	"log"
+	"os"
 	"sync"
 
 	"net/http"
@@ -23,6 +24,17 @@ func main() {
 	go runGlobalWsHub()     // 启动全局事件广播 Hub
 	initCronTasks()         // 初始化定时任务表并启动活跃任务
 
+	// 初始化密码保险箱
+	encryptionKeyStr := os.Getenv("APP_ENCRYPTION_KEY")
+	if encryptionKeyStr == "" {
+		log.Println("警告: 环境变量 APP_ENCRYPTION_KEY 未设置。密码保险箱功能将不可用，且相关API会返回错误。")
+	} else {
+		if err := initEncryption(encryptionKeyStr); err != nil {
+			log.Fatalf("启动失败: 无效的加密密钥: %v", err)
+		}
+		log.Println("密码保险箱功能已启用。")
+	}
+
 	var err error
 	chromeExecutablePath, err = getChromePath()
 	if err != nil {
@@ -40,6 +52,7 @@ func main() {
 	http.HandleFunc("/ws/events", globalEventsWsHandler)
 	http.HandleFunc("/ws", wsHandler)
 	http.HandleFunc("/list", listSessions)
+	http.HandleFunc("/run_dsl_bulk", runDSLBulk) // 新增：批量执行 DSL 接口
 	http.HandleFunc("/run_dsl", runDSL)
 	http.HandleFunc("/stop_dsl", stopDSL)
 	http.HandleFunc("/user_input", userInput)
@@ -50,6 +63,11 @@ func main() {
 	http.HandleFunc("/api/cron/save", authMiddleware(apiSaveCron))
 	http.HandleFunc("/api/cron/delete", authMiddleware(apiDeleteCron))
 	http.HandleFunc("/api/cron/toggle", authMiddleware(apiToggleCron))
+
+	// 密码保险箱 API
+	http.HandleFunc("/api/secret/list", authMiddleware(apiListSecrets))
+	http.HandleFunc("/api/secret/save", authMiddleware(apiSaveSecret))
+	http.HandleFunc("/api/secret/delete", authMiddleware(apiDeleteSecret))
 
 	// OAuth2 Handlers
 	http.HandleFunc("/login", loginHandler)

@@ -50,17 +50,41 @@ function add(id, initIsRunning = false) {
   editBtn.innerHTML = '⚙️';
   editBtn.title = '编译 DSL';
 
+  const showQrCodeBtn = document.createElement('button');
+  showQrCodeBtn.className = 'icon-btn btn-qrcode'; // 新增的二维码显示按钮
+  showQrCodeBtn.innerHTML = '📷';
+  showQrCodeBtn.title = '显示二维码面板';
+  showQrCodeBtn.style.display = 'none'; // 默认隐藏
+  showQrCodeBtn.onclick = () => {
+    card.querySelector('.interaction-overlay').classList.add('active');
+  };
+  const showInteractionBtn = document.createElement('button');
+  showInteractionBtn.className = 'icon-btn btn-input';
+  showInteractionBtn.innerHTML = '⌨️';
+  showInteractionBtn.title = '显示交互面板';
+  showInteractionBtn.style.display = 'none'; // 默认隐藏
+  showInteractionBtn.onclick = () => {
+    card.querySelector('.interaction-panel').style.display = 'flex';
+  };
+
   const closeBtn = document.createElement('button');
   closeBtn.className = 'icon-btn btn-close';
   closeBtn.innerHTML = '✖';
   closeBtn.title = '关闭浏览器';
 
   actionsDiv.appendChild(logBtn);
+  actionsDiv.appendChild(showQrCodeBtn); // 添加二维码显示按钮
   actionsDiv.appendChild(editBtn);
+  actionsDiv.appendChild(showInteractionBtn);
   actionsDiv.appendChild(closeBtn);
 
   overlay.appendChild(actionsDiv);
   overlay.appendChild(execBtn);
+
+  const errorDisplay = document.createElement('div');
+  errorDisplay.className = 'error-display';
+  overlay.appendChild(errorDisplay);
+
   card.appendChild(overlay);
 
   // 2. 创建内部 DSL 编辑器浮层
@@ -143,6 +167,11 @@ function add(id, initIsRunning = false) {
   interactionPanel.className = 'interaction-panel';
   card.appendChild(interactionPanel);
 
+  // 新增：预先创建二维码面板，并保持隐藏
+  const qrCodeOverlay = document.createElement('div');
+  qrCodeOverlay.className = 'interaction-overlay';
+  card.appendChild(qrCodeOverlay);
+
   // 5. 绑定事件
   logBtn.onclick = () => {
     logPanel.style.display = 'flex';
@@ -162,9 +191,14 @@ function add(id, initIsRunning = false) {
   const showRunningState = () => {
     isRunning = true;
     card.classList.add('running');
+    runningIndicator.innerText = '⏳ 正在执行...';
     execBtn.innerText = '⏹ 终止';
     execBtn.disabled = false;
     updateStats();
+
+    // 清理可能存在的错误提示
+    const errorDisplay = card.querySelector('.error-display');
+    errorDisplay.style.display = 'none';
   };
 
   const showStoppedState = () => {
@@ -172,20 +206,40 @@ function add(id, initIsRunning = false) {
     card.classList.remove('running');
     execBtn.innerText = '▶ 执行';
     execBtn.disabled = false;
+
+    // 清理可能存在的错误提示
+    const errorDisplay = card.querySelector('.error-display');
+    errorDisplay.style.display = 'none';
+
     // 停止时也清理交互UI
     const interactionPanel = card.querySelector('.interaction-panel');
     if (interactionPanel) {
-        interactionPanel.style.display = 'none';
-        interactionPanel.innerHTML = '';
+      interactionPanel.style.display = 'none';
+      interactionPanel.innerHTML = '';
     }
     updateStats();
   };
+
+  const showErrorState = (message) => {
+    isRunning = false;
+    card.classList.remove('running'); // 确保不计入“运行中”
+
+    const errorDisplay = card.querySelector('.error-display');
+    errorDisplay.innerText = `❌ ${message}`;
+    errorDisplay.style.display = 'block';
+
+    execBtn.innerText = '▶ 执行';
+    execBtn.disabled = false;
+    updateStats();
+  };
+
+
 
   if (initIsRunning) {
     showRunningState();
   }
 
-  execBtn.onclick = () => {
+  execBtn.onclick = async () => {
     if (isRunning) {
       execBtn.disabled = true;
       fetch(`/stop_dsl?id=${id}`, { method: 'POST' })
@@ -194,8 +248,16 @@ function add(id, initIsRunning = false) {
     }
     logContent.innerHTML = ''; // 执行前清空旧日志
     showRunningState();
-    fetch(`/run_dsl?id=${id}`, { method: 'POST', body: textarea.value })
-      .then(() => showStoppedState());
+    try {
+      const res = await fetch(`/run_dsl?id=${id}`, { method: 'POST', body: textarea.value });
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(errorText || '执行失败');
+      }
+      showStoppedState();
+    } catch (err) {
+      showErrorState(err.message);
+    }
   };
 
   document.getElementById('list').appendChild(card);
@@ -229,8 +291,29 @@ function add(id, initIsRunning = false) {
 
 function handleInteraction(card, payload) {
   if (payload.inputType === 'prompt') {
+    const showInteractionBtn = card.querySelector('.btn-input');
     const interactionPanel = card.querySelector('.interaction-panel');
     interactionPanel.innerHTML = ''; // Clear previous content
+
+    const closeInteractionBtn = document.createElement('button');
+    closeInteractionBtn.innerHTML = '✖';
+    closeInteractionBtn.title = '关闭交互面板';
+    closeInteractionBtn.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: none;
+        border: none;
+        color: white;
+        font-size: 20px;
+        cursor: pointer;
+        padding: 5px;
+        line-height: 1;
+    `;
+    closeInteractionBtn.onclick = () => {
+      interactionPanel.style.display = 'none';
+      if (showInteractionBtn) showInteractionBtn.style.display = 'none'; 
+    };
 
     const promptText = document.createElement('p');
     promptText.innerText = payload.prompt;
@@ -255,29 +338,52 @@ function handleInteraction(card, payload) {
         });
     };
 
+    interactionPanel.appendChild(closeInteractionBtn);
     interactionPanel.appendChild(promptText);
     interactionPanel.appendChild(input);
     interactionPanel.appendChild(submitBtn);
     interactionPanel.style.display = 'flex';
   } else if (payload.inputType === 'qrcode') {
-    let overlay = card.querySelector('.interaction-overlay');
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.className = 'interaction-overlay';
-      if (getComputedStyle(card).position === 'static') {
-        card.style.position = 'relative';
-      }
-      card.appendChild(overlay);
-    }
+    const showQrCodeBtn = card.querySelector('.btn-qrcode');
+    const overlay = card.querySelector('.interaction-overlay');
+
+    // 每次需要显示时，都重新创建关闭按钮，因为 overlay 的内容会被清空
+    const closeOverlayBtn = document.createElement('button');
+    closeOverlayBtn.innerHTML = '✖';
+    closeOverlayBtn.title = '关闭二维码面板';
+    closeOverlayBtn.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: none;
+        border: none;
+        color: #333; /* 二维码面板是浅色背景，使用深色关闭按钮 */
+        font-size: 20px;
+        cursor: pointer;
+        padding: 5px;
+        line-height: 1;
+        z-index: 50; /* 确保在二维码之上 */
+    `;
+    closeOverlayBtn.onclick = () => {
+      overlay.classList.remove('active');
+      if (showQrCodeBtn) showQrCodeBtn.style.display = 'flex'; // 显示重新打开的按钮
+    };
+
     overlay.innerHTML = `
         <img src="${payload.qrCodeData}" class="qr-code" alt="QR Code">
         <p class="prompt-text">${payload.prompt}</p>
     `;
+    overlay.prepend(closeOverlayBtn);
     overlay.classList.add('active');
   }
 }
 
 function handleInteractionEnd(card) {
+  const showQrCodeBtn = card.querySelector('.btn-qrcode');
+  if (showQrCodeBtn) showQrCodeBtn.style.display = 'none'; // 结束时隐藏二维码按钮
+  const showInteractionBtn = card.querySelector('.btn-input');
+  if (showInteractionBtn) showInteractionBtn.style.display = 'none';
+
   const interactionPanel = card.querySelector('.interaction-panel');
   if (interactionPanel) {
     interactionPanel.style.display = 'none';

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,69 +20,9 @@ import (
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
-func create(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	isPersistent := r.URL.Query().Get("persistent") == "true"
-	var userDataDir string
-	var id string
-
-	if isPersistent {
-		select {
-		case dir := <-persistentDirPool:
-			userDataDir = dir
-			log.Printf("从池中复用持久化目录: %s", userDataDir)
-		default:
-			// Pool is empty, create a new directory for a persistent session
-			userDataDir = filepath.Join(persistentDataPath, fmt.Sprintf("session-%d", time.Now().UnixNano()))
-			log.Printf("池为空，新建持久化目录: %s", userDataDir)
-		}
-		id = filepath.Base(userDataDir) // Use directory name as ID for simplicity
-	} else {
-		id = fmt.Sprintf("temp-%d", time.Now().UnixNano())
-		userDataDir = filepath.Join(os.TempDir(), "chrome-"+id)
-	}
-
-	port := nextPort
-	nextPort++
-
-	cmd := launchChrome(chromeExecutablePath, port, userDataDir)
-	wsURL, err := getWSURL(port)
-	if err != nil {
-		cmd.Process.Kill()
-		os.RemoveAll(userDataDir)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	client, err := NewClient(wsURL)
-	if err != nil {
-		cmd.Process.Kill()
-		os.RemoveAll(userDataDir)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// 必须 enable
-	client.Call("Page.enable", nil)
-	// client.Call("Page.navigate", map[string]interface{}{"url": "about:blank"})
-
-	session := &Session{
-		ID:            id,
-		IsPersistent:  isPersistent,
-		Client:        client,
-		Cmd:           cmd,
-		UserDataDir:   userDataDir,
-		WS:            make(map[*websocket.Conn]bool),
-		broadcast:     make(chan []byte, 256),
-		userInputChan: make(chan string, 1),
-	}
-	go session.broadcastLoop()
-
-	client.onClose = func() {
-		deleteSession(id)
-	}
-
+// setupSessionHandlers configures the onCall, onResponse, and onEvent handlers for a session's client.
+func setupSessionHandlers(session *Session) {
+	client := session.Client
 	// Callback for outgoing DevTools Protocol calls
 	client.onCall = func(id int, method string, params interface{}) {
 		if method == "Page.screencastFrameAck" { // 不记录发出的 ACK 消息
@@ -151,28 +93,150 @@ func create(w http.ResponseWriter, r *http.Request) {
 			s.lastFrame = frame.Data
 			s.wsMu.Unlock()
 
-			message, _ := json.Marshal(map[string]interface{}{
-				"type":      "screencast",
-				"sessionId": s.ID,
-				"data":      frame.Data,
-			})
-
+			message, _ := json.Marshal(map[string]interface{}{"type": "screencast", "sessionId": s.ID, "data": frame.Data})
 			select {
 			case s.broadcast <- message:
 			default:
 				fmt.Printf("Session %s: broadcast channel full, dropping screencast frame.\n", s.ID)
 			}
-
-			// 必须为收到的每一个 frame 进行 ACK，否则浏览器会停止发送。
 			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
 		}
 	}
+	client.Call("Page.startScreencast", map[string]interface{}{"format": "jpeg", "quality": 50})
+}
 
-	// 👉 放在 navigate 后
-	client.Call("Page.startScreencast", map[string]interface{}{
-		"format":  "jpeg",
-		"quality": 50,
-	})
+func create(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	isPersistent := r.URL.Query().Get("persistent") == "true"
+
+	if isPersistent {
+		var parentSession *Session
+		for _, s := range sessions {
+			if s.IsPersistent && s.Cmd != nil { // Find an existing master persistent session
+				parentSession = s
+				break
+			}
+		}
+
+		if parentSession != nil {
+			// Found an existing persistent browser, create a new tab in it.
+			log.Printf("在已有的持久化浏览器 %s 中创建新标签页", parentSession.ID)
+
+			newTarget, err := parentSession.Client.Call("Target.createTarget", map[string]interface{}{"url": "about:blank", "newWindow": false})
+			if err != nil {
+				http.Error(w, "创建新标签页失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			var targetInfo struct {
+				TargetID string `json:"targetId"`
+			}
+			json.Unmarshal(newTarget, &targetInfo)
+			if targetInfo.TargetID == "" {
+				http.Error(w, "获取新标签页ID失败", http.StatusInternalServerError)
+				return
+			}
+
+			// A new tab is created, now get its specific websocket URL
+			wsURL, err := getWSURLForTarget(parentSession.Port, targetInfo.TargetID)
+			if err != nil {
+				parentSession.Client.Call("Target.closeTarget", map[string]interface{}{"targetId": targetInfo.TargetID})
+				http.Error(w, "获取新标签页连接信息失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			client, err := NewClient(wsURL)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			client.Call("Page.enable", nil)
+
+			id := fmt.Sprintf("%s-tab-%d", parentSession.ID, time.Now().UnixNano())
+			session := &Session{
+				ID:            id,
+				Port:          parentSession.Port,
+				ParentClient:  parentSession.Client,
+				TargetID:      targetInfo.TargetID,
+				IsPersistent:  true,
+				Client:        client,
+				Cmd:           nil,
+				UserDataDir:   parentSession.UserDataDir,
+				WS:            make(map[*websocket.Conn]bool),
+				broadcast:     make(chan []byte, 256),
+				userInputChan: make(chan string, 1),
+			}
+			go session.broadcastLoop()
+			client.onClose = func() { deleteSession(id) }
+			setupSessionHandlers(session)
+			sessions[id] = session
+			json.NewEncoder(w).Encode(map[string]string{"sessionId": id})
+			return
+		}
+	}
+
+	var userDataDir string
+	var id string
+	if isPersistent {
+		select {
+		case dir := <-persistentDirPool:
+			userDataDir = dir
+			log.Printf("从池中复用持久化目录: %s", userDataDir)
+		default:
+			// Pool is empty, create a new directory for a persistent session
+			userDataDir = filepath.Join(persistentDataPath, fmt.Sprintf("session-%d", time.Now().UnixNano()))
+			log.Printf("池为空，新建持久化目录: %s", userDataDir)
+		}
+		id = filepath.Base(userDataDir) // Use directory name as ID for simplicity
+	} else {
+		id = fmt.Sprintf("temp-%d", time.Now().UnixNano()) // Fallback to creating a new browser
+		userDataDir = filepath.Join(os.TempDir(), "chrome-"+id)
+	}
+
+	port := nextPort
+	nextPort++
+
+	cmd := launchChrome(chromeExecutablePath, port, userDataDir)
+	wsURL, err := getWSURL(port)
+	if err != nil {
+		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	client, err := NewClient(wsURL)
+	if err != nil {
+		cmd.Process.Kill()
+		os.RemoveAll(userDataDir)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 必须 enable
+	client.Call("Page.enable", nil)
+	// client.Call("Page.navigate", map[string]interface{}{"url": "about:blank"})
+
+	session := &Session{
+		ID:            id,
+		Port:          port,
+		IsPersistent:  isPersistent,
+		Client:        client,
+		Cmd:           cmd,
+		UserDataDir:   userDataDir,
+		WS:            make(map[*websocket.Conn]bool),
+		broadcast:     make(chan []byte, 256),
+		userInputChan: make(chan string, 1),
+	}
+	go session.broadcastLoop()
+
+	client.onClose = func() {
+		deleteSession(id)
+	}
+
+	setupSessionHandlers(session)
 
 	sessions[id] = session
 
@@ -213,6 +277,40 @@ func runDSL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the raw body to check for secrets before decoding
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	containsSecret := bytes.Contains(bodyBytes, []byte("{{secret."))
+
+	var creatorID string
+	var userIsAuthenticated bool
+
+	// Manually check for authentication, similar to authMiddleware but without failing on unauth
+	cookie, err := r.Cookie("session_id")
+	if err == nil {
+		sessionID := cookie.Value
+		userInfoVal, ok := userSessions.Load(sessionID)
+		if ok {
+			userInfo, castOk := userInfoVal.(UserInfo)
+			if castOk {
+				userIsAuthenticated = true
+				creatorID = userInfo.OaID
+			}
+		}
+	}
+
+	if containsSecret && !userIsAuthenticated {
+		http.Error(w, "未登录用户无法在DSL中使用密码保险箱功能。", http.StatusForbidden)
+		return
+	}
+
+	// Restore the body so it can be read again by json.NewDecoder
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
 	// 清理旧日志，并标记 DSL 开始执行
 	s.wsMu.Lock()
 	s.isDslRunning = true
@@ -240,9 +338,110 @@ func runDSL(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	variables := make(map[string]string)
-	executeDSLActions(ctx, s, actions, variables)
+	executeDSLActions(ctx, s, actions, variables, creatorID)
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// DSLBulkRequest 定义了批量 DSL 执行的请求体结构
+type DSLBulkRequest [][]DSLAction
+
+// runDSLBulk 处理批量执行 DSL 的请求
+func runDSLBulk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	mu.Lock()
+	s, ok := sessions[id]
+	mu.Unlock()
+
+	if !ok {
+		http.Error(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// Read the raw body to check for secrets before decoding
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		return
+	}
+
+	containsSecret := bytes.Contains(bodyBytes, []byte("{{secret."))
+
+	var creatorID string
+	var userIsAuthenticated bool
+
+	// Manually check for authentication, similar to authMiddleware but without failing on unauth
+	cookie, err := r.Cookie("session_id")
+	if err == nil {
+		sessionID := cookie.Value
+		userInfoVal, ok := userSessions.Load(sessionID)
+		if ok {
+			userInfo, castOk := userInfoVal.(UserInfo)
+			if castOk {
+				userIsAuthenticated = true
+				creatorID = userInfo.OaID
+			}
+		}
+	}
+
+	if containsSecret && !userIsAuthenticated {
+		http.Error(w, "未登录用户无法在批量DSL中使用密码保险箱功能。", http.StatusForbidden)
+		return
+	}
+
+	// Restore the body so it can be read again by json.NewDecoder
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	var bulkActions DSLBulkRequest
+	if err := json.NewDecoder(r.Body).Decode(&bulkActions); err != nil {
+		http.Error(w, "Invalid JSON for bulk DSL", http.StatusBadRequest)
+		return
+	}
+
+	// 清理旧日志，并标记 DSL 开始执行
+	s.wsMu.Lock()
+	s.isDslRunning = true // 标记会话正在运行批量DSL
+	s.lastLogs = nil
+	s.wsMu.Unlock()
+
+	defer func() {
+		s.wsMu.Lock()
+		s.isDslRunning = false
+		s.cancelDSL = nil // 确保在批量任务结束后取消函数也被清理
+		s.wsMu.Unlock()
+	}()
+
+	for i, actions := range bulkActions {
+		log.Printf("Session %s: 开始执行批量 DSL 任务批次 %d/%d", s.ID, i+1, len(bulkActions))
+		// 为每次 DSL 序列创建独立的 Context.WithCancel，但共用会话
+		ctx, cancel := context.WithCancel(context.Background())
+		s.wsMu.Lock()
+		s.cancelDSL = cancel // 允许停止整个批量任务
+		s.wsMu.Unlock()
+
+		variables := make(map[string]string)
+		executeDSLActions(ctx, s, actions, variables, creatorID)
+
+		s.wsMu.Lock()
+		currentCancelFunc := s.cancelDSL // 获取当前cancelDSL，防止在执行executeDSLActions时被外部stopDSL修改
+		s.wsMu.Unlock()
+		if currentCancelFunc != nil {
+			currentCancelFunc() // 任务批次完成后，取消该批次的上下文
+		}
+
+		if ctx.Err() != nil {
+			log.Printf("Session %s: 批量 DSL 任务在批次 %d/%d 处被终止: %v", s.ID, i+1, len(bulkActions), ctx.Err())
+			http.Error(w, fmt.Sprintf("批量 DSL 任务在批次 %d 处被终止: %v", i+1, ctx.Err()), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "批量 DSL 任务执行完成。"})
 }
 
 func userInput(w http.ResponseWriter, r *http.Request) {
@@ -333,11 +532,32 @@ func pollForSuccess(ctx context.Context, s *Session, expression string, timeout 
 	}
 }
 
-var varRegex = regexp.MustCompile(`\{\{([a-zA-Z0-9_]+)\}\}`)
+var varRegex = regexp.MustCompile(`\{\{([a-zA-Z0-9_.]+)\}\}`)
 
-func substituteVariables(text string, variables map[string]string) string {
+func substituteVariables(text string, variables map[string]string, creatorID string) string {
 	return varRegex.ReplaceAllStringFunc(text, func(match string) string {
 		key := match[2 : len(match)-2]
+		if strings.HasPrefix(key, "secret.") {
+			if len(encryptionKey) == 0 {
+				log.Printf("警告: 尝试使用密码 '%s'，但密码保险箱未配置 (APP_ENCRYPTION_KEY 缺失)。", key)
+				return match // Return original if vault is not configured
+			}
+			secretName := strings.TrimPrefix(key, "secret.")
+			var encryptedValue string
+			err := db.QueryRow("SELECT value FROM secrets WHERE name = ? AND creator_id = ?", secretName, creatorID).Scan(&encryptedValue)
+			if err != nil {
+				log.Printf("无法找到密码 '%s' (用户: %s): %v", secretName, creatorID, err)
+				return match // Return original if secret not found
+			}
+
+			decryptedValue, err := decrypt(encryptedValue)
+			if err != nil {
+				log.Printf("解密密码 '%s' 失败 (用户: %s): %v", secretName, creatorID, err)
+				return match // Return original on decryption failure
+			}
+			return decryptedValue
+		}
+
 		if val, ok := variables[key]; ok {
 			return val
 		}
@@ -345,7 +565,7 @@ func substituteVariables(text string, variables map[string]string) string {
 	})
 }
 
-func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, variables map[string]string) {
+func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, variables map[string]string, creatorID string) {
 	for _, action := range actions {
 		// 每次执行指令前检查是否收到了终止信号
 		if ctx.Err() != nil {
@@ -353,13 +573,13 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		}
 
 		// 替换所有可能包含变量的字段
-		action.URL = substituteVariables(action.URL, variables)
-		action.Selector = substituteVariables(action.Selector, variables)
-		action.Value = substituteVariables(action.Value, variables)
-		action.Script = substituteVariables(action.Script, variables)
-		action.Condition = substituteVariables(action.Condition, variables)
-		action.Prompt = substituteVariables(action.Prompt, variables)
-		action.SuccessSelector = substituteVariables(action.SuccessSelector, variables)
+		action.URL = substituteVariables(action.URL, variables, creatorID)
+		action.Selector = substituteVariables(action.Selector, variables, creatorID)
+		action.Value = substituteVariables(action.Value, variables, creatorID)
+		action.Script = substituteVariables(action.Script, variables, creatorID)
+		action.Condition = substituteVariables(action.Condition, variables, creatorID)
+		action.Prompt = substituteVariables(action.Prompt, variables, creatorID)
+		action.SuccessSelector = substituteVariables(action.SuccessSelector, variables, creatorID)
 
 		switch action.Type {
 		case "navigate":
@@ -391,36 +611,68 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			// 额外给前端框架 500ms 的宽限期，用于完成复杂的事件绑定(Hydration)
 			time.Sleep(500 * time.Millisecond)
 		case "input":
-			expr := fmt.Sprintf("document.querySelector(`%s`).value = `%s`", action.Selector, action.Value)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
-		case "checkbox":
-			shouldBeChecked := "false"
-			if action.Value == "true" {
-				shouldBeChecked = "true"
+			focusExpr := fmt.Sprintf("document.querySelector(`%s`).focus()", action.Selector)
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusExpr})
+
+			if action.Value != "" {
+				s.Client.Call("Input.insertText", map[string]interface{}{
+					"text": action.Value,
+				})
 			}
-			// This JS ensures a checkbox is in a specific state (checked or unchecked).
-			// It finds the element and if its `checked` state is not the desired one, it clicks it.
-			// Clicking is more robust than setting `element.checked` as it triggers events.
-			expr := fmt.Sprintf("const el = document.querySelector(`%s`); if (el && el.checked !== %s) { el.click(); }", action.Selector, shouldBeChecked)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
-		case "radio":
-			// This JS is for selecting a radio button.
-			// It iterates through elements found by `selector` (e.g., a radio group)
-			// and clicks the one whose `value` attribute matches the `value` from the action.
-			expr := fmt.Sprintf("const radios = document.querySelectorAll(`%s`); for (const radio of radios) { if (radio.value === `%s`) { if (!radio.checked) { radio.click(); } break; } }", action.Selector, action.Value)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+		case "checkbox": // 使用CDP先检查状态，再决定是否点击，更接近原生操作
+			getCheckedStateExpr := fmt.Sprintf("document.querySelector(`%s`) ? document.querySelector(`%s`).checked : null", action.Selector, action.Selector)
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCheckedStateExpr, "returnByValue": true})
+			if err != nil {
+				log.Printf("Session %s: checkbox state check failed for '%s': %v", s.ID, action.Selector, err)
+				return
+			}
+			var res struct {
+				Result struct {
+					Value *bool `json:"value"`
+				} `json:"result"`
+			}
+			json.Unmarshal(raw, &res)
+
+			if res.Result.Value != nil {
+				currentlyChecked := *res.Result.Value
+				shouldBeChecked := action.Value == "true"
+				if currentlyChecked != shouldBeChecked {
+					clickExpr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
+					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr})
+				}
+			} else {
+				log.Printf("Session %s: checkbox element not found '%s'", s.ID, action.Selector)
+			}
+		case "radio": // 改造为使用更精确的组合选择器直接点击，而不是JS循环
+			// 这种方式假定选择器能定位到 radio 组 (例如, 'input[name="group"]'),
+			// 然后通过 action.Value 来指定具体要点击的那个选项的 value.
+			clickExpr := fmt.Sprintf("document.querySelector(`%s[value='%s']`).click()", action.Selector, action.Value)
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr})
 		case "click":
 			expr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
 		case "select":
-			expr := fmt.Sprintf("var el = document.querySelector(`%s`); el.value = `%s`; el.dispatchEvent(new Event('change', {bubbles: true}));", action.Selector, action.Value)
+			// 改造为更稳健的方式，在设置 value 后，同时触发 input 和 change 事件，以兼容各类前端框架
+			expr := fmt.Sprintf(`
+				const select = document.querySelector('%s');
+				if (select && select.value !== '%s') {
+					select.value = '%s';
+					select.dispatchEvent(new Event('input', { bubbles: true }));
+					select.dispatchEvent(new Event('change', { bubbles: true }));
+				}
+			`, action.Selector, action.Value, action.Value)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
 		case "keypress":
 			// 1. 如果传入了选择器，敲击前先强制让该元素获取焦点
 			if action.Selector != "" {
-				expr := fmt.Sprintf(`var el = document.querySelector("%s"); if(el) el.focus();`, action.Selector)
-				s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
-				time.Sleep(50 * time.Millisecond) // 等待 focus 真正生效
+				focusExpr := fmt.Sprintf(`document.querySelector("%s").focus()`, action.Selector)
+				s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusExpr})
+
+				// 等待元素真正获得焦点
+				pollExpr := fmt.Sprintf("document.activeElement === document.querySelector(`%s`)", action.Selector)
+				if err := pollForSuccess(ctx, s, pollExpr, 5*time.Second); err != nil {
+					log.Printf("Session %s: keypress 操作无法聚焦于元素 '%s': %v", s.ID, action.Selector, err)
+				}
 			}
 
 			// 2. 针对 Enter 键，需要附带 text 属性才能被部分框架正确捕获
@@ -475,9 +727,9 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				fmt.Println("raw", raw)
 				json.Unmarshal(raw, &res)
 				if res.Result.Value {
-					executeDSLActions(ctx, s, action.Then, variables)
+					executeDSLActions(ctx, s, action.Then, variables, creatorID)
 				} else {
-					executeDSLActions(ctx, s, action.Else, variables)
+					executeDSLActions(ctx, s, action.Else, variables, creatorID)
 				}
 			} else {
 				fmt.Println("if err", err)
@@ -580,7 +832,23 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 
 func del(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	deleteSession(id)
+	mu.Lock()
+	s, ok := sessions[id]
+	mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	if s.Cmd != nil { // This is a master session, closing it will kill the process.
+		s.Client.conn.Close()
+	} else if s.ParentClient != nil && s.TargetID != "" { // This is a tab session.
+		// Closing the target should automatically close its dedicated websocket,
+		// which will trigger the client.onClose for the tab's client.
+		s.ParentClient.Call("Target.closeTarget", map[string]interface{}{"targetId": s.TargetID})
+	} else {
+		s.Client.conn.Close() // Fallback for tab sessions without parent info.
+	}
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
@@ -799,12 +1067,14 @@ func stopCronJob(id int) {
 }
 
 func runCronDSL(dslID int) {
-	var content string
-	err := db.QueryRow("SELECT content FROM dsl_scripts WHERE id=?", dslID).Scan(&content)
+	var content, creatorID string
+	err := db.QueryRow("SELECT content, creator_id FROM dsl_scripts WHERE id=?", dslID).Scan(&content, &creatorID)
 	if err != nil {
+		log.Printf("定时任务执行失败: 无法获取 DSL 脚本 %d: %v", dslID, err)
 		return
 	}
 	var actions []DSLAction
+
 	json.Unmarshal([]byte(content), &actions)
 
 	// 1. 在后台初始化一个新的无头浏览器实例
@@ -883,7 +1153,7 @@ func runCronDSL(dslID int) {
 	session.cancelDSL = cancel
 	session.wsMu.Unlock()
 
-	executeDSLActions(ctx, session, actions, make(map[string]string))
+	executeDSLActions(ctx, session, actions, make(map[string]string), creatorID)
 }
 
 // --- CRUD ---
@@ -908,6 +1178,74 @@ func apiListCron(w http.ResponseWriter, r *http.Request) {
 		tasks = []CronTask{}
 	}
 	json.NewEncoder(w).Encode(tasks)
+}
+
+// --- 密码保险箱 CRUD ---
+
+// Secret 定义了密码保险箱中的一个条目
+type Secret struct {
+	Name        string `json:"name"`
+	Value       string `json:"value,omitempty"`       // 在列出时不返回 value
+	Description string `json:"description,omitempty"` // 说明
+}
+
+func apiListSecrets(w http.ResponseWriter, r *http.Request) {
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+	rows, err := db.Query("SELECT name, description FROM secrets WHERE creator_id = ? ORDER BY name", userInfo.OaID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var secrets []Secret
+	for rows.Next() {
+		var s Secret
+		if err := rows.Scan(&s.Name, &s.Description); err == nil {
+			secrets = append(secrets, s)
+		}
+	}
+	if secrets == nil {
+		secrets = []Secret{}
+	}
+	json.NewEncoder(w).Encode(secrets)
+}
+
+func apiSaveSecret(w http.ResponseWriter, r *http.Request) {
+	if len(encryptionKey) == 0 {
+		http.Error(w, "密码保险箱功能未在服务器上配置。", http.StatusServiceUnavailable)
+		return
+	}
+
+	var secret Secret
+	if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if secret.Name == "" || secret.Value == "" {
+		http.Error(w, "密码的名称和值不能为空", http.StatusBadRequest)
+		return
+	}
+
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	encryptedValue, err := encrypt(secret.Value)
+	if err != nil {
+		http.Error(w, "加密密码失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 使用 INSERT OR REPLACE (UPSERT) 逻辑
+	_, err = db.Exec("INSERT INTO secrets (name, value, description, creator_id) VALUES (?, ?, ?, ?) ON CONFLICT(name, creator_id) DO UPDATE SET value=excluded.value, description=excluded.description",
+		secret.Name, encryptedValue, secret.Description, userInfo.OaID)
+
+	if err != nil {
+		http.Error(w, "保存密码失败", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func apiSaveCron(w http.ResponseWriter, r *http.Request) {
@@ -1035,6 +1373,22 @@ func broadcastSessionEvent(eventType string, payload interface{}) {
 	default:
 		fmt.Println("Global hub broadcast channel is full. Message dropped.")
 	}
+}
+
+func apiDeleteSecret(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "缺少密码名称参数", http.StatusBadRequest)
+		return
+	}
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	_, err := db.Exec("DELETE FROM secrets WHERE name=? AND creator_id=?", name, userInfo.OaID)
+	if err != nil {
+		http.Error(w, "删除密码失败", http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
 func apiDeleteCron(w http.ResponseWriter, r *http.Request) {

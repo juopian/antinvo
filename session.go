@@ -12,6 +12,9 @@ import (
 
 type Session struct {
 	ID            string
+	Port          int
+	ParentClient  *Client
+	TargetID      string
 	IsPersistent  bool
 	Client        *Client
 	Cmd           *exec.Cmd
@@ -33,40 +36,47 @@ var chromeExecutablePath string
 
 func deleteSession(id string) {
 	mu.Lock()
-	defer mu.Unlock()
+	s, ok := sessions[id]
+	if !ok {
+		mu.Unlock()
+		return
+	}
+	delete(sessions, id)
+	mu.Unlock()
 
-	if s, ok := sessions[id]; ok {
-		close(s.broadcast)
-		s.Client.conn.Close()
-		if s.Cmd != nil && s.Cmd.Process != nil {
-			s.Cmd.Process.Kill()
-		}
+	close(s.broadcast)
+	// The connection is already closed or closing, which is what triggers this function.
 
-		// Delete user data directory
-		if s.UserDataDir != "" { // s.UserDataDir will be an empty string if chrome fails to start
-			if s.IsPersistent {
-				// For persistent sessions, return the directory to the pool
+	if s.Cmd != nil && s.Cmd.Process != nil {
+		s.Cmd.Process.Kill()
+	}
+
+	// Delete user data directory
+	if s.UserDataDir != "" {
+		if s.IsPersistent {
+			// Only master sessions (which own a Cmd) return their dir to the pool.
+			if s.Cmd != nil {
 				select {
 				case persistentDirPool <- s.UserDataDir:
 					log.Printf("已释放持久化数据目录到池中: %s", s.UserDataDir)
 				default:
 					log.Printf("持久化目录池已满，未释放: %s", s.UserDataDir)
 				}
-			} else {
-				os.RemoveAll(s.UserDataDir)
-				log.Printf("已删除临时数据目录: %s", s.UserDataDir)
 			}
+		} else {
+			os.RemoveAll(s.UserDataDir)
+			log.Printf("已删除临时数据目录: %s", s.UserDataDir)
 		}
-
-		s.wsMu.Lock()
-		for ws := range s.WS {
-			ws.Close()
-		}
-		s.wsMu.Unlock()
-
-		delete(sessions, id)
-		log.Println("已清理关闭的浏览器资源, Session ID:", id)
 	}
+
+	s.wsMu.Lock()
+	for ws := range s.WS {
+		ws.Close()
+	}
+	s.wsMu.Unlock()
+
+	log.Println("已清理关闭的浏览器资源, Session ID:", id)
+	broadcastSessionEvent("session_removed", map[string]string{"id": id})
 }
 
 func (s *Session) broadcastLoop() {
