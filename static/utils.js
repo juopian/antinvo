@@ -3,7 +3,6 @@ var globalDSLs = [];
 var globalCrons = [];
 var dslEditor = null;
 var batchDslEditor = null; // 用于批量DSL管理模态框中的DSL预览/编辑
-var batchGeneratedDsls = []; // 存储批量生成的DSL
 var sessionsRestored = false;
 
 function updateStats() {

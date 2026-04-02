@@ -1,13 +1,17 @@
 function create(isPersistent) {
   fetch(`/create?persistent=${isPersistent}`, { method: 'POST' })
     .then(r => r.json())
-    .then(d => add(d.sessionId));
+    .then(d => add(d.sessionId, false, d.isPersistent));
 }
 
-function add(id, initIsRunning = false) {
+function add(id, initIsRunning = false, isPersistent = false) {
   const card = document.createElement('div');
   card.className = 'session-card';
   card.dataset.sessionId = id; // 添加一个 data-* 属性用于选择
+
+  if (isPersistent) {
+    card.classList.add('persistent');
+  }
 
   const img = document.createElement('img');
   card.appendChild(img);
@@ -25,6 +29,11 @@ function add(id, initIsRunning = false) {
     cronIndicator.className = 'cron-indicator';
     cronIndicator.innerText = '⏰ 定时任务';
     card.appendChild(cronIndicator);
+  } else if (isPersistent) {
+    const persistentIndicator = document.createElement('div');
+    persistentIndicator.className = 'persistent-indicator';
+    persistentIndicator.innerText = '🌟 持久化';
+    card.appendChild(persistentIndicator);
   }
 
   // 1. 创建遮罩层
@@ -90,20 +99,85 @@ function add(id, initIsRunning = false) {
   // 2. 创建内部 DSL 编辑器浮层
   const editorDiv = document.createElement('div');
   editorDiv.className = 'dsl-editor';
+  
+  // AI 智能生成栏
+  const aiContainer = document.createElement('div');
+  aiContainer.style.display = 'flex';
+  aiContainer.style.gap = '10px';
+  aiContainer.style.marginBottom = '10px';
 
+  const aiInput = document.createElement('input');
+  aiInput.type = 'text';
+  aiInput.placeholder = '✨ 输入自然语言，例如：打开百度搜索xxx';
+  aiInput.style.flex = "1";
+  aiInput.style.padding = "8px";
+
+  const aiBtn = document.createElement('button');
+  aiBtn.innerText = '🪄 智能生成';
+  aiBtn.className = 'primary';
+  aiBtn.onclick = async () => {
+    const prompt = aiInput.value.trim();
+    if (!prompt) return;
+    aiBtn.disabled = true;
+    aiBtn.innerText = '生成中...';
+    try {
+      const res = await fetch('/api/generate_dsl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      textarea.value = await res.text();
+    } catch (e) {
+      alert('AI生成失败: ' + e.message);
+    } finally {
+      aiBtn.disabled = false;
+      aiBtn.innerText = '🪄 智能生成';
+    }
+  };
+
+  aiContainer.appendChild(aiInput);
+  aiContainer.appendChild(aiBtn);
+
+  const selectContainer = document.createElement('div');
+  selectContainer.style.display = 'flex';
+  selectContainer.style.gap = '10px';
+  selectContainer.style.marginBottom = '10px';
+  
   const selectDsl = document.createElement('select');
   selectDsl.style.padding = "8px";
-  selectDsl.style.marginBottom = "10px";
-  selectDsl.innerHTML = '<option value="">-- 选择已保存的DSL快速填入 --</option>';
+  selectDsl.style.flex = "1";
+  selectDsl.innerHTML = '<option value="">-- 选择单个DSL --</option>';
   globalDSLs.forEach(d => {
     selectDsl.innerHTML += `<option value='${d.content.replace(/'/g, "&#39;")}'>${d.name}</option>`;
   });
-  selectDsl.onchange = (e) => {
-    if (e.target.value) textarea.value = e.target.value;
-  };
 
   const textarea = document.createElement('textarea');
   textarea.value = `[\n  {"type": "navigate", "url": "https://www.baidu.com"}\n ]`;
+
+  const selectBatchDsl = document.createElement('select');
+  selectBatchDsl.style.padding = "8px";
+  selectBatchDsl.style.flex = "1";
+  selectBatchDsl.innerHTML = '<option value="">-- 选择批量DSL --</option>';
+  globalBatchDSLs.forEach(d => {
+    selectBatchDsl.innerHTML += `<option value='${d.content.replace(/'/g, "&#39;")}'>${d.name}</option>`;
+  });
+
+  selectDsl.onchange = (e) => {
+    if (e.target.value) {
+      textarea.value = e.target.value;
+      selectBatchDsl.value = "";
+    }
+  };
+  selectBatchDsl.onchange = (e) => {
+    if (e.target.value) {
+      textarea.value = e.target.value;
+      selectDsl.value = "";
+    }
+  };
+
+  selectContainer.appendChild(selectDsl);
+  selectContainer.appendChild(selectBatchDsl);
 
   let lastSavedDsl = textarea.value;
 
@@ -129,7 +203,8 @@ function add(id, initIsRunning = false) {
   btnGroup.appendChild(saveBtn);
   btnGroup.appendChild(cancelBtn);
 
-  editorDiv.appendChild(selectDsl);
+  editorDiv.appendChild(aiContainer);
+  editorDiv.appendChild(selectContainer);
   editorDiv.appendChild(textarea);
   editorDiv.appendChild(btnGroup);
   card.appendChild(editorDiv);
@@ -185,6 +260,7 @@ function add(id, initIsRunning = false) {
 
   editBtn.onclick = () => {
     selectDsl.value = "";
+    selectBatchDsl.value = "";
     editorDiv.style.display = 'flex';
   };
 
@@ -249,7 +325,22 @@ function add(id, initIsRunning = false) {
     logContent.innerHTML = ''; // 执行前清空旧日志
     showRunningState();
     try {
-      const res = await fetch(`/run_dsl?id=${id}`, { method: 'POST', body: textarea.value });
+      let isBatch = false;
+      let dslContent;
+      try {
+        dslContent = JSON.parse(textarea.value);
+        // 如果是数组，且第一个元素也是数组，则认为是批量DSL
+        if (Array.isArray(dslContent) && dslContent.length > 0 && Array.isArray(dslContent[0])) {
+          isBatch = true;
+        }
+      } catch (e) {
+        // JSON 解析失败，按单任务DSL处理，让后端报错
+        isBatch = false;
+      }
+
+      const endpoint = isBatch ? '/run_dsl_bulk' : '/run_dsl';
+      const res = await fetch(`${endpoint}?id=${id}`, { method: 'POST', body: textarea.value });
+
       if (!res.ok) {
         const errorText = await res.text();
         throw new Error(errorText || '执行失败');
@@ -343,6 +434,67 @@ function handleInteraction(card, payload) {
     interactionPanel.appendChild(input);
     interactionPanel.appendChild(submitBtn);
     interactionPanel.style.display = 'flex';
+  } else if (payload.inputType === 'captcha') {
+    const showInteractionBtn = card.querySelector('.btn-input');
+    const interactionPanel = card.querySelector('.interaction-panel');
+    interactionPanel.innerHTML = ''; // Clear previous content
+
+    const closeInteractionBtn = document.createElement('button');
+    closeInteractionBtn.innerHTML = '✖';
+    closeInteractionBtn.title = '关闭交互面板';
+    closeInteractionBtn.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: none;
+        border: none;
+        color: white;
+        font-size: 20px;
+        cursor: pointer;
+        padding: 5px;
+        line-height: 1;
+    `;
+    closeInteractionBtn.onclick = () => {
+      interactionPanel.style.display = 'none';
+      if (showInteractionBtn) showInteractionBtn.style.display = 'none';
+    };
+
+    const captchaImage = document.createElement('img');
+    captchaImage.src = payload.captchaData;
+    captchaImage.style.maxWidth = '100%';
+    captchaImage.style.height = 'auto';
+    captchaImage.style.marginBottom = '10px';
+
+    const promptText = document.createElement('p');
+    promptText.innerText = payload.prompt;
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '请输入验证码...';
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        submitBtn.click();
+      }
+    };
+
+    const submitBtn = document.createElement('button');
+    submitBtn.innerText = '提交';
+    submitBtn.onclick = () => {
+      const sessionId = card.dataset.sessionId;
+      const value = input.value;
+      fetch(`/user_input?id=${sessionId}`, { method: 'POST', body: value })
+        .then(res => {
+          if (!res.ok) alert('提交失败或任务已超时');
+        });
+    };
+
+    interactionPanel.appendChild(closeInteractionBtn);
+    interactionPanel.appendChild(captchaImage);
+    interactionPanel.appendChild(promptText);
+    interactionPanel.appendChild(input);
+    interactionPanel.appendChild(submitBtn);
+    interactionPanel.style.display = 'flex';
+    if (showInteractionBtn) showInteractionBtn.style.display = 'flex'; // Ensure the button is visible
   } else if (payload.inputType === 'qrcode') {
     const showQrCodeBtn = card.querySelector('.btn-qrcode');
     const overlay = card.querySelector('.interaction-overlay');
@@ -403,7 +555,7 @@ async function restoreSessions() {
 
   if (data.sessions && data.sessions.length > 0) {
     data.sessions.forEach(sessionInfo => {
-      add(sessionInfo.id, sessionInfo.isRunning);
+      add(sessionInfo.id, sessionInfo.isRunning, sessionInfo.isPersistent);
     });
   }
   sessionsRestored = true;

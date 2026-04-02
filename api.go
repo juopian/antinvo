@@ -173,7 +173,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 			client.onClose = func() { deleteSession(id) }
 			setupSessionHandlers(session)
 			sessions[id] = session
-			json.NewEncoder(w).Encode(map[string]string{"sessionId": id})
+			json.NewEncoder(w).Encode(map[string]interface{}{"sessionId": id, "isPersistent": true})
 			return
 		}
 	}
@@ -240,7 +240,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 	sessions[id] = session
 
-	json.NewEncoder(w).Encode(map[string]string{"sessionId": id})
+	json.NewEncoder(w).Encode(map[string]interface{}{"sessionId": id, "isPersistent": isPersistent})
 }
 
 // DSLAction 定义了单个自动化操作的结构
@@ -259,6 +259,7 @@ type DSLAction struct {
 	Prompt          string      `json:"prompt,omitempty"`          // wait_for_input 的提示信息
 	VariableName    string      `json:"variableName,omitempty"`    // wait_for_input 存储用户输入的变量名
 	SuccessSelector string      `json:"successSelector,omitempty"` // wait_for_qrcode_scan 的成功标识元素
+	CaptchaSelector string      `json:"captchaSelector,omitempty"` // wait_for_captcha 的图形验证码元素选择器
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -427,18 +428,13 @@ func runDSLBulk(w http.ResponseWriter, r *http.Request) {
 		variables := make(map[string]string)
 		executeDSLActions(ctx, s, actions, variables, creatorID)
 
-		s.wsMu.Lock()
-		currentCancelFunc := s.cancelDSL // 获取当前cancelDSL，防止在执行executeDSLActions时被外部stopDSL修改
-		s.wsMu.Unlock()
-		if currentCancelFunc != nil {
-			currentCancelFunc() // 任务批次完成后，取消该批次的上下文
-		}
-
 		if ctx.Err() != nil {
 			log.Printf("Session %s: 批量 DSL 任务在批次 %d/%d 处被终止: %v", s.ID, i+1, len(bulkActions), ctx.Err())
 			http.Error(w, fmt.Sprintf("批量 DSL 任务在批次 %d 处被终止: %v", i+1, ctx.Err()), http.StatusInternalServerError)
+			cancel() // 确保上下文被取消
 			return
 		}
+		cancel() // 正常完成，清理当前批次的上下文
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "批量 DSL 任务执行完成。"})
@@ -756,6 +752,66 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 					return
 				}
 			}
+		case "wait_for_captcha":
+			// 1. 提取图形验证码的 src 或 data URL
+			getCaptchaExpr := fmt.Sprintf(`
+				(() => {
+					const el = document.querySelector('%s');
+					if (!el) return null;
+					if (el.tagName.toLowerCase() === 'img') return el.src;
+					if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
+					return null;
+				})()
+			`, action.CaptchaSelector)
+
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCaptchaExpr, "returnByValue": true})
+			if err != nil {
+				log.Printf("Session %s: 获取图形验证码失败: %v", s.ID, err)
+				return
+			}
+
+			var res struct {
+				Result struct {
+					Value string `json:"value"`
+				} `json:"result"`
+			}
+			json.Unmarshal(raw, &res)
+			captchaData := res.Result.Value
+
+			if captchaData == "" {
+				log.Printf("Session %s: 未找到图形验证码元素或元素内容为空 (%s)", s.ID, action.CaptchaSelector)
+				return
+			}
+
+			// 2. 将图形验证码和输入框广播到前端
+			prompt := "请输入验证码"
+			if action.Prompt != "" {
+				prompt = action.Prompt
+			}
+			interactionPayload := map[string]interface{}{
+				"type": "user_interaction_required",
+				"payload": map[string]string{
+					"inputType":   "captcha",
+					"captchaData": captchaData,
+					"prompt":      prompt,
+				},
+			}
+			msg, _ := json.Marshal(interactionPayload)
+			s.broadcast <- msg
+
+			// 3. 等待用户输入
+			select {
+			case userInput := <-s.userInputChan:
+				if action.VariableName != "" {
+					variables[action.VariableName] = userInput
+				}
+				finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+				s.broadcast <- finishMsg
+			case <-ctx.Done():
+				finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+				s.broadcast <- finishMsg
+				return
+			}
 		case "wait_for_qrcode_scan":
 			// 1. 提取二维码的 src 或 data URL
 			getQrCodeExpr := fmt.Sprintf(`
@@ -904,8 +960,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type SessionInfo struct {
-	ID        string `json:"id"`
-	IsRunning bool   `json:"isRunning"`
+	ID           string `json:"id"`
+	IsRunning    bool   `json:"isRunning"`
+	IsPersistent bool   `json:"isPersistent"`
 }
 
 func listSessions(w http.ResponseWriter, r *http.Request) {
@@ -918,7 +975,7 @@ func listSessions(w http.ResponseWriter, r *http.Request) {
 		isRunning := s.cancelDSL != nil
 		s.wsMu.Unlock()
 
-		infos = append(infos, SessionInfo{ID: id, IsRunning: isRunning})
+		infos = append(infos, SessionInfo{ID: id, IsRunning: isRunning, IsPersistent: s.IsPersistent})
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{"sessions": infos})
@@ -989,6 +1046,175 @@ func apiDeleteDSL(w http.ResponseWriter, r *http.Request) {
 	}
 	db.Exec("DELETE FROM dsl_scripts WHERE id=? AND creator_id=?", id, userInfo.OaID)
 	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// --- Batch DSL Management CRUD ---
+
+func apiListBatchDSL(w http.ResponseWriter, r *http.Request) {
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+	rows, err := db.Query("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM batch_dsl_scripts WHERE creator_id = ? ORDER BY id DESC", userInfo.OaID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var dsls []DSL
+	for rows.Next() {
+		var d DSL
+		if err := rows.Scan(&d.ID, &d.Name, &d.Content, &d.CreatorID, &d.CreatedAt); err == nil {
+			dsls = append(dsls, d)
+		}
+	}
+	if dsls == nil {
+		dsls = []DSL{}
+	}
+	json.NewEncoder(w).Encode(dsls)
+}
+
+func apiSaveBatchDSL(w http.ResponseWriter, r *http.Request) {
+	var dsl DSL
+	if err := json.NewDecoder(r.Body).Decode(&dsl); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	if dsl.ID == 0 {
+		res, _ := db.Exec("INSERT INTO batch_dsl_scripts (name, content, creator_id) VALUES (?, ?, ?)", dsl.Name, dsl.Content, userInfo.OaID)
+		id, _ := res.LastInsertId()
+		dsl.ID = int(id)
+	} else {
+		var owner string
+		err := db.QueryRow("SELECT creator_id FROM batch_dsl_scripts WHERE id=?", dsl.ID).Scan(&owner)
+		if err != nil || owner != userInfo.OaID {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		db.Exec("UPDATE batch_dsl_scripts SET name=?, content=? WHERE id=? AND creator_id=?", dsl.Name, dsl.Content, dsl.ID, userInfo.OaID)
+	}
+
+	var finalDsl DSL
+	db.QueryRow("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM batch_dsl_scripts WHERE id=?", dsl.ID).Scan(&finalDsl.ID, &finalDsl.Name, &finalDsl.Content, &finalDsl.CreatorID, &finalDsl.CreatedAt)
+	json.NewEncoder(w).Encode(finalDsl)
+}
+
+func apiDeleteBatchDSL(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
+
+	var owner string
+	err := db.QueryRow("SELECT creator_id FROM batch_dsl_scripts WHERE id=?", id).Scan(&owner)
+	if err != nil || owner != userInfo.OaID {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	db.Exec("DELETE FROM batch_dsl_scripts WHERE id=? AND creator_id=?", id, userInfo.OaID)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// --- AI / LLM DSL Generator ---
+
+type GenerateDSLRequest struct {
+	Prompt string `json:"prompt"`
+}
+
+func apiGenerateDSL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	apiKey := os.Getenv("LLM_API_KEY")
+	if apiKey == "" {
+		http.Error(w, "未配置 LLM_API_KEY 环境变量，无法使用 AI 生成功能。", http.StatusServiceUnavailable)
+		return
+	}
+
+	baseURL := os.Getenv("LLM_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1/chat/completions" // 默认使用 OpenAI，你可以替换为 DeepSeek 等
+	}
+	model := os.Getenv("LLM_MODEL")
+	if model == "" {
+		model = "gpt-4o"
+	}
+
+	var reqData GenerateDSLRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqData); err != nil || reqData.Prompt == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	systemPrompt := `你是一个RPA(机器人流程自动化)脚本生成专家。
+请根据用户的自然语言指令，生成对应的 JSON 格式的 DSL 脚本。
+仅输出合法的 JSON 数组，不要包含任何 markdown 标记 (如 ` + "```" + `json) 或其他说明文字。
+
+支持的常用操作类型 (type) 及其参数如下：
+- navigate: {"type": "navigate", "url": "网页地址"}
+- input: {"type": "input", "selector": "CSS选择器", "value": "要输入的文本"}
+- click: {"type": "click", "selector": "CSS选择器"}
+- wait: {"type": "wait", "ms": 毫秒数}
+- wait_selector: {"type": "wait_selector", "selector": "CSS选择器", "timeout": 等待超时秒数}
+- keypress: {"type": "keypress", "selector": "CSS选择器", "value": "按键名，如Enter"}
+
+示例：
+用户：打开百度，搜索“golang”，然后点击搜索按钮
+输出：
+[
+  {"type": "navigate", "url": "https://www.baidu.com"},
+  {"type": "wait_selector", "selector": "#kw", "timeout": 5},
+  {"type": "input", "selector": "#kw", "value": "golang"},
+  {"type": "click", "selector": "#su"}
+]`
+
+	payload := map[string]interface{}{
+		"model":       model,
+		"temperature": 0.1, // 较低的温度以确保输出稳定的 JSON 格式
+		"messages": []map[string]string{
+			{"role": "system", "content": systemPrompt},
+			{"role": "user", "content": reqData.Prompt},
+		},
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	httpReq, _ := http.NewRequest("POST", baseURL, bytes.NewReader(bodyBytes))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		http.Error(w, "调用大模型 API 失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	var respData struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil || len(respData.Choices) == 0 {
+	if err := json.Unmarshal(body, &respData); err != nil || len(respData.Choices) == 0 {
+		http.Error(w, "大模型 API 返回格式解析失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 清理 Markdown JSON 代码块符号（应对模型不听话的情况）
+	content := strings.TrimSpace(respData.Choices[0].Message.Content)
+	content = strings.TrimPrefix(content, "```json")
+	content = strings.TrimPrefix(content, "```")
+	content = strings.TrimSuffix(content, "```")
+	content = strings.TrimSpace(content)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(content))
 }
 
 // --- 定时任务管理调度 ---
@@ -1137,7 +1363,7 @@ func runCronDSL(dslID int) {
 	sessions[id] = session
 	mu.Unlock()
 
-	broadcastSessionEvent("session_added", SessionInfo{ID: id, IsRunning: true})
+	broadcastSessionEvent("session_added", SessionInfo{ID: id, IsRunning: true, IsPersistent: session.IsPersistent})
 
 	// 无论执行成功或发生错误，最终销毁关闭该次临时浏览器
 	defer func() {

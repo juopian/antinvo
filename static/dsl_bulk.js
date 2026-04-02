@@ -1,39 +1,93 @@
 // /Users/xiecp/Documents/antinvo-go/static/dsl_bulk.js
 
+let globalBatchDSLs = [];
+
 /**
- * Opens the Batch DSL Management modal.
+ * Fetches the list of batch DSLs from the server.
+ */
+async function fetchBatchDsls() {
+    try {
+        const res = await fetch('/api/batch_dsl/list');
+        if (!res.ok) {
+            throw new Error('Failed to fetch batch DSLs');
+        }
+        globalBatchDSLs = await res.json();
+        renderBatchDslList();
+    } catch (error) {
+        console.error('Error fetching batch DSLs:', error);
+        alert('获取批量DSL列表失败: ' + error.message);
+    }
+}
+
+/**
+ * Renders the list of batch DSLs into the modal.
+ */
+function renderBatchDslList() {
+    const listDiv = document.getElementById('batchDslList');
+    listDiv.innerHTML = '';
+    const currentId = parseInt(document.getElementById('editBatchDslId').value) || 0;
+
+    globalBatchDSLs.forEach(dsl => {
+        const item = document.createElement('div');
+        item.className = 'dsl-list-item' + (dsl.id === currentId ? ' active' : '');
+        item.innerText = dsl.name;
+        item.onclick = () => selectBatchDsl(dsl);
+        listDiv.appendChild(item);
+    });
+}
+
+/**
+ * Selects a batch DSL to view/edit.
+ * @param {object} dsl The DSL object to select.
+ */
+function selectBatchDsl(dsl) {
+    document.getElementById('editBatchDslId').value = dsl.id;
+    document.getElementById('editBatchDslName').value = dsl.name;
+    window.batchDslEditor.setValue(dsl.content || '', -1);
+    document.getElementById('btnDelBatchDsl').style.display = 'block';
+    renderBatchDslList(); // Refresh highlight
+}
+
+/**
+ * Opens the Batch DSL Management modal and populates the template dropdown.
  */
 async function openBatchDslModal() {
     const modal = document.getElementById('batchDslModal');
     const templateSelect = document.getElementById('batchDslTemplateSelect');
 
-    // Clear and repopulate the DSL template dropdown
+    // Populate DSL template dropdown from the global list of normal DSLs
     templateSelect.innerHTML = '<option value="">-- 请选择一个 DSL 脚本作为模板 --</option>';
     globalDSLs.forEach(dsl => {
         templateSelect.innerHTML += `<option value="${dsl.id}">${dsl.name}</option>`;
     });
 
-    // Reset the state
-    batchGeneratedDsls = [];
-    document.getElementById('batchDslDataFileInput').value = ''; // Clear file input
-    renderBatchDslList(); // This will show the "empty" message and hide buttons
+    // Here you would fetch and render the list of SAVED BATCH DSLs into #batchDslList
+    await fetchBatchDsls();
+    createNewBatchDsl();
 
     modal.style.display = 'flex';
 }
 
 /**
- * Closes the Batch DSL Management modal.
+ * Closes the batch DSL management modal.
  */
 function closeBatchDslModal() {
     document.getElementById('batchDslModal').style.display = 'none';
 }
 
 /**
- * Reads a data file (CSV) and a DSL template to generate multiple DSL scripts.
+ * Reads a data file (CSV) and a DSL template to generate a single batch DSL script
+ * and places it in the editor.
  */
 async function generateDslFromTemplate() {
     const templateSelect = document.getElementById('batchDslTemplateSelect');
     const dataFileInput = document.getElementById('batchDslDataFileInput');
+    const editor = window.batchDslEditor;
+
+    if (!editor) {
+        alert("编辑器未初始化。");
+        return;
+    }
 
     const selectedTemplateId = templateSelect.value;
     const dataFile = dataFileInput.files[0];
@@ -43,152 +97,118 @@ async function generateDslFromTemplate() {
         return;
     }
     if (!dataFile) {
-        alert("请选择一个数据文件 (如 CSV)。");
+        alert("请选择一个数据文件 (例如 CSV, XLSX, XLS)。");
         return;
     }
 
     const templateDsl = globalDSLs.find(d => d.id === parseInt(selectedTemplateId));
     if (!templateDsl) {
-        alert("未找到选定的 DSL 模板。");
+        alert("未找到所选的 DSL 模板。");
         return;
     }
 
-    // Read the data file
     const reader = new FileReader();
+    const fileType = dataFile.name.split('.').pop().toLowerCase();
+
     reader.onload = async (e) => {
-        const csvContent = e.target.result;
-        // Robust line splitting
-        const lines = csvContent.split(/\r\n|\n/).filter(line => line.trim() !== '');
+        let dataRows = [];
+        let headers = [];
 
-        if (lines.length < 2) {
-            alert("数据文件需要至少包含一个标题行和一行数据。");
-            return;
-        }
+        try {
+            if (fileType === 'csv') {
+                const csvContent = e.target.result;
+                const lines = csvContent.split(/\r\n|\n/).filter(line => line.trim() !== '');
+                if (lines.length < 2) {
+                    throw new Error("CSV 文件需要至少包含一个标题行和一行数据。");
+                }
+                headers = lines[0].split(',').map(h => h.trim());
+                dataRows = lines.slice(1).map(line => {
+                    const data = line.split(',').map(d => d.trim());
+                    if (data.length !== headers.length) {
+                        console.warn(`跳过CSV中列数不匹配的行：${line}`);
+                        return null;
+                    }
+                    let rowObject = {};
+                    headers.forEach((header, index) => {
+                        rowObject[header] = data[index];
+                    });
+                    return rowObject;
+                }).filter(Boolean);
 
-        // Assuming the first line is the header
-        const headers = lines[0].split(',').map(h => h.trim());
-        batchGeneratedDsls = []; // Reset the list
-
-        for (let i = 1; i < lines.length; i++) {
-            const data = lines[i].split(',').map(d => d.trim());
-            if (data.length !== headers.length) {
-                console.warn(`跳过第 ${i + 1} 行数据，列数不匹配：${lines[i]}`);
-                continue;
+            } else if (fileType === 'xlsx' || fileType === 'xls') {
+                if (typeof XLSX === 'undefined') {
+                    throw new Error("XLSX 库未加载。无法处理 Excel 文件。");
+                }
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                const firstSheetName = workbook.SheetNames[0];
+                if (!firstSheetName) {
+                    throw new Error("Excel 文件中没有找到工作表。");
+                }
+                const worksheet = workbook.Sheets[firstSheetName];
+                dataRows = XLSX.utils.sheet_to_json(worksheet, { defval: "" });
+                if (dataRows.length > 0) {
+                    headers = Object.keys(dataRows[0]);
+                }
             }
 
-            let generatedContent = templateDsl.content;
-            let generatedName = templateDsl.name;
+            if (dataRows.length === 0) {
+                alert("文件中没有找到可用的数据行。");
+                return;
+            }
 
-            // Replace placeholders in the template
-            headers.forEach((header, index) => {
-                const placeholder = `{{${header}}}`;
-                const value = data[index] || '';
-                // Use replaceAll for multiple occurrences
-                generatedContent = generatedContent.replaceAll(placeholder, value);
-                generatedName = generatedName.replaceAll(placeholder, value);
+            const batchDslArray = [];
+            dataRows.forEach((row, rowIndex) => {
+                let singleDslContentString = templateDsl.content;
+
+                headers.forEach((header) => {
+                    const placeholder = `{{${header}}}`;
+                    const value = row[header] !== undefined ? String(row[header]) : '';
+                    const jsonValue = JSON.stringify(value).slice(1, -1);
+                    singleDslContentString = singleDslContentString.replaceAll(placeholder, jsonValue);
+                });
+
+                try {
+                    const singleDslObject = JSON.parse(singleDslContentString);
+                    batchDslArray.push(singleDslObject);
+                } catch (parseError) {
+                    throw new Error(`处理第 ${rowIndex + 2} 行数据时发生错误: 无法解析生成的DSL片段。请检查您的模板和数据。\n错误: ${parseError.message}\n内容: ${singleDslContentString}`);
+                }
             });
 
-            batchGeneratedDsls.push({
-                id: 0, // New DSLs have an ID of 0
-                name: generatedName,
-                content: generatedContent,
-                // Store a temporary unique index for selection management
-                tempId: `batch_${i-1}`,
-                selected: true // Default to selected for bulk operations
-            });
-        }
+            const finalBatchContent = JSON.stringify(batchDslArray, null, 2);
+            editor.setValue(finalBatchContent, -1);
+            document.getElementById('editBatchDslName').value = `批量生成于 ${new Date().toLocaleTimeString()}`;
 
-        renderBatchDslList();
-        if (batchGeneratedDsls.length > 0) {
-            // Automatically select the first generated DSL for preview
-            selectBatchDsl(batchGeneratedDsls[0].tempId);
-        } else {
-            alert("未能生成任何 DSL 脚本，请检查数据文件和模板。");
+        } catch (error) {
+            alert(error.message);
+            console.error(error);
         }
     };
-    reader.readAsText(dataFile);
-}
+    reader.onerror = () => {
+        alert("读取文件失败。");
+    };
 
-/**
- * Renders the list of generated DSLs in the modal.
- */
-function renderBatchDslList() {
-    const listContainer = document.getElementById('batchDslListContainer');
-    const deleteBtn = document.getElementById('deleteSelectedDslsBtn');
-    const saveAllBtn = document.getElementById('saveAllBatchDslsBtn');
-    const previewContainer = document.getElementById('batchDslPreviewContainer');
-    const currentSelectedTempId = document.getElementById('currentBatchDslIndex').value;
-
-    listContainer.innerHTML = '';
-
-    if (batchGeneratedDsls.length === 0) {
-        listContainer.innerHTML = '<p style="text-align: center; color: #666; margin-top: 20px;">没有生成的 DSL 脚本。</p>';
-        deleteBtn.style.display = 'none';
-        saveAllBtn.style.display = 'none';
-        previewContainer.style.display = 'none';
-        return;
-    }
-
-    deleteBtn.style.display = 'inline-block';
-    saveAllBtn.style.display = 'inline-block';
-
-    batchGeneratedDsls.forEach(dsl => {
-        const item = document.createElement('div');
-        item.className = 'dsl-list-item' + (dsl.tempId === currentSelectedTempId ? ' active' : '');
-        item.innerHTML = `
-      <input type="checkbox" ${dsl.selected ? 'checked' : ''} onchange="toggleBatchDslSelection('${dsl.tempId}', this.checked)">
-      <span onclick="selectBatchDsl('${dsl.tempId}')" style="flex-grow: 1; cursor: pointer;">${dsl.name}</span>
-    `;
-        listContainer.appendChild(item);
-    });
-}
-
-/**
- * Toggles the selection state of a generated DSL.
- * @param {string} tempId - The temporary ID of the DSL.
- * @param {boolean} isSelected - The new selection state.
- */
-function toggleBatchDslSelection(tempId, isSelected) {
-    const dsl = batchGeneratedDsls.find(d => d.tempId === tempId);
-    if (dsl) {
-        dsl.selected = isSelected;
+    if (fileType === 'xlsx' || fileType === 'xls') {
+        reader.readAsArrayBuffer(dataFile);
+    } else if (fileType === 'csv') {
+        reader.readAsText(dataFile);
+    } else {
+        alert("不支持的文件类型。请上传 CSV, XLSX, 或 XLS 文件。");
     }
 }
 
 /**
- * Selects a generated DSL to show in the preview editor.
- * @param {string} tempId - The temporary ID of the DSL to select.
- */
-function selectBatchDsl(tempId) {
-    const dsl = batchGeneratedDsls.find(d => d.tempId === tempId);
-    if (!dsl) {
-        // If the selected DSL was deleted, hide the preview
-        document.getElementById('batchDslPreviewContainer').style.display = 'none';
-        document.getElementById('currentBatchDslIndex').value = '-1';
-        renderBatchDslList();
-        return;
-    }
-
-    document.getElementById('batchDslPreviewContainer').style.display = 'flex';
-    document.getElementById('batchDslPreviewName').value = dsl.name;
-    batchDslEditor.setValue(dsl.content || '', -1);
-    document.getElementById('currentBatchDslIndex').value = tempId;
-
-    // Re-render the list to update the active highlight
-    renderBatchDslList();
-}
-
-/**
- * Formats the JSON content in the batch preview editor.
+ * Formats the JSON content in the batch editor.
  */
 function formatBatchDslJson() {
     try {
-        const session = batchDslEditor.getSession();
+        const session = window.batchDslEditor.getSession();
         const currentJson = session.getValue();
         if (currentJson) {
             const formattedJson = JSON.stringify(JSON.parse(currentJson), null, 2);
             session.setValue(formattedJson);
-            batchDslEditor.clearSelection();
+            window.batchDslEditor.clearSelection();
         }
     } catch (e) {
         alert("JSON 格式不正确，无法格式化。\n" + e.message);
@@ -196,149 +216,82 @@ function formatBatchDslJson() {
 }
 
 /**
- * Saves the currently previewed DSL to the backend.
+ * The following functions are stubs. Their implementation would be very similar
+ * to the ones in dsl.js, but would interact with backend endpoints for batch DSLs.
  */
-async function saveCurrentBatchDsl() {
-    const tempId = document.getElementById('currentBatchDslIndex').value;
-    if (tempId === '-1') {
-        alert("没有选中的 DSL 脚本可供保存。");
-        return;
-    }
 
-    const dslIndex = batchGeneratedDsls.findIndex(d => d.tempId === tempId);
-    if (dslIndex === -1) {
-        alert("脚本已不存在。");
-        return;
-    }
-
-    const dslToSave = { ...batchGeneratedDsls[dslIndex] };
-    dslToSave.name = document.getElementById('batchDslPreviewName').value.trim();
-    dslToSave.content = batchDslEditor.getValue().trim();
-
-    if (!dslToSave.name) {
-        alert("DSL 脚本名称不能为空。");
-        return;
-    }
-
-    try {
-        if (dslToSave.content) JSON.parse(dslToSave.content);
-    } catch (e) {
-        if (!confirm("DSL 脚本内容 JSON 格式不正确，是否继续保存？\n" + e.message)) return;
-    }
-
-    try {
-        await saveDslToBackend(dslToSave);
-        alert(`脚本 "${dslToSave.name}" 保存成功!`);
-
-        // Remove the saved DSL from the temporary list
-        batchGeneratedDsls.splice(dslIndex, 1);
-
-        // Select the next item or hide the preview
-        const nextDsl = batchGeneratedDsls[dslIndex] || batchGeneratedDsls[dslIndex - 1];
-        selectBatchDsl(nextDsl ? nextDsl.tempId : null);
-        
-        // Refresh the main DSL list in the background
-        fetchDSLs();
-
-    } catch (error) {
-        alert(`保存脚本 "${dslToSave.name}" 失败: ${error.message}`);
-    }
+function createNewBatchDsl() {
+  document.getElementById('editBatchDslId').value = 0;
+  document.getElementById('editBatchDslName').value = '';
+  window.batchDslEditor.setValue('[\n  \n]', -1);
+  document.getElementById('btnDelBatchDsl').style.display = 'none';
+  renderBatchDslList(); // This would re-render the list on the left
 }
 
-/**
- * Saves all selected DSLs from the generated list to the backend.
- */
-async function saveAllBatchGeneratedDsls() {
-    const selectedDsls = batchGeneratedDsls.filter(dsl => dsl.selected);
-    if (selectedDsls.length === 0) {
-        alert("没有选中的 DSL 脚本可供保存。");
+async function saveCurrentBatchDsl() {
+    const id = parseInt(document.getElementById('editBatchDslId').value) || 0;
+    const name = document.getElementById('editBatchDslName').value.trim();
+    const content = window.batchDslEditor.getValue().trim();
+
+    if (!name) {
+        alert("批量脚本名称不能为空");
         return;
     }
 
-    if (!confirm(`确定要保存所有 ${selectedDsls.length} 个选中的 DSL 脚本吗？`)) {
-        return;
-    }
-
-    let successCount = 0;
-    let failedDsls = [];
-
-    for (const dsl of selectedDsls) {
-        try {
-            await saveDslToBackend(dsl);
-            successCount++;
-            // Mark for removal
-            dsl.toRemove = true;
-        } catch (error) {
-            console.error(`保存 DSL "${dsl.name}" 失败:`, error);
-            failedDsls.push(dsl.name);
+    try {
+        if (content) JSON.parse(content);
+    } catch (e) {
+        if (!confirm("JSON 格式似乎不正确，是否继续保存？\n" + e.message)) {
+            return;
         }
     }
 
-    // Remove saved DSLs from the list
-    batchGeneratedDsls = batchGeneratedDsls.filter(dsl => !dsl.toRemove);
-    
-    let alertMessage = `成功保存 ${successCount} 个脚本。`;
-    if (failedDsls.length > 0) {
-        alertMessage += `\n以下 ${failedDsls.length} 个脚本保存失败:\n- ${failedDsls.join('\n- ')}`;
-    }
-    alert(alertMessage);
+    try {
+        const res = await fetch('/api/batch_dsl/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, name, content })
+        });
 
-    // Refresh the view
-    const currentSelectedTempId = document.getElementById('currentBatchDslIndex').value;
-    const isCurrentSelectedRemoved = !batchGeneratedDsls.some(d => d.tempId === currentSelectedTempId);
-    if (isCurrentSelectedRemoved) {
-        selectBatchDsl(batchGeneratedDsls.length > 0 ? batchGeneratedDsls[0].tempId : null);
-    } else {
-        renderBatchDslList();
-    }
+        if (!res.ok) {
+            const errorText = await res.text();
+            throw new Error(errorText || 'Failed to save batch DSL');
+        }
 
-    // Refresh the main DSL list in the background
-    if (successCount > 0) {
-        fetchDSLs();
+        const updatedDsl = await res.json();
+        alert('保存成功');
+        await fetchBatchDsls();
+        selectBatchDsl(updatedDsl);
+    } catch (error) {
+        console.error('Error saving batch DSL:', error);
+        alert('保存失败: ' + error.message);
     }
 }
 
-/**
- * Deletes all selected DSLs from the generated list (client-side only).
- */
-function deleteSelectedDsls() {
-    const selectedCount = batchGeneratedDsls.filter(d => d.selected).length;
-    if (selectedCount === 0) {
-        alert("没有选中的 DSL 脚本可供删除。");
+async function deleteCurrentBatchDsl() {
+    const id = document.getElementById('editBatchDslId').value;
+    if (!id || id == "0") {
+        return;
+    }
+    if (!confirm("确定要删除此批量脚本吗？")) {
         return;
     }
 
-    if (!confirm(`确定要从列表中移除选中的 ${selectedCount} 个脚本吗？此操作不会影响已保存的脚本。`)) {
-        return;
+    try {
+        const response = await fetch(`/api/batch_dsl/delete?id=${id}`, {
+            method: 'POST'
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(errorText || 'Failed to delete batch DSL');
+        }
+
+        alert('删除成功!');
+        await fetchBatchDsls();
+        createNewBatchDsl();
+    } catch (error) {
+        console.error('Error deleting batch DSL:', error);
+        alert('删除失败: ' + error.message);
     }
-
-    const currentSelectedTempId = document.getElementById('currentBatchDslIndex').value;
-    const wasCurrentSelected = batchGeneratedDsls.find(d => d.tempId === currentSelectedTempId && d.selected);
-
-    batchGeneratedDsls = batchGeneratedDsls.filter(dsl => !dsl.selected);
-
-    if (wasCurrentSelected) {
-        selectBatchDsl(batchGeneratedDsls.length > 0 ? batchGeneratedDsls[0].tempId : null);
-    } else {
-        renderBatchDslList();
-    }
-}
-
-/**
- * Helper to save a DSL object to the backend.
- * @param {object} dsl - The DSL object to save.
- * @returns {Promise<object>} The saved DSL object from the backend.
- */
-async function saveDslToBackend(dsl) {
-  const res = await fetch('/api/dsl/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    // Ensure dsl object has id, name, content
-    body: JSON.stringify({ id: dsl.id || 0, name: dsl.name, content: dsl.content })
-  });
-  if (!res.ok) {
-    const errorText = await res.text();
-    throw new Error(errorText || 'Failed to save DSL');
-  }
-  return await res.json();
 }

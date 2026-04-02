@@ -40,6 +40,20 @@ func initDB() {
 		log.Fatalf("创建数据库表失败: %q", err)
 	}
 
+	// 新增：批量DSL脚本表
+	batchDslTableStmt := `
+	CREATE TABLE IF NOT EXISTS batch_dsl_scripts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		content TEXT NOT NULL,
+		creator_id TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(batchDslTableStmt)
+	if err != nil {
+		log.Fatalf("创建批量DSL脚本表失败: %q", err)
+	}
+
 	// 新增：创建用户会话表
 	sessionTableStmt := `
 	CREATE TABLE IF NOT EXISTS user_sessions (

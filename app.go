@@ -59,6 +59,14 @@ func main() {
 	http.HandleFunc("/api/dsl/list", authMiddleware(apiListDSL))
 	http.HandleFunc("/api/dsl/save", authMiddleware(apiSaveDSL))
 	http.HandleFunc("/api/dsl/delete", authMiddleware(apiDeleteDSL))
+
+	// 批量 DSL API
+	http.HandleFunc("/api/batch_dsl/list", authMiddleware(apiListBatchDSL))
+	http.HandleFunc("/api/batch_dsl/save", authMiddleware(apiSaveBatchDSL))
+	http.HandleFunc("/api/batch_dsl/delete", authMiddleware(apiDeleteBatchDSL))
+
+	http.HandleFunc("/api/generate_dsl", apiGenerateDSL) // 允许不强制登录调用，或者按需包上 authMiddleware
+
 	http.HandleFunc("/api/cron/list", authMiddleware(apiListCron))
 	http.HandleFunc("/api/cron/save", authMiddleware(apiSaveCron))
 	http.HandleFunc("/api/cron/delete", authMiddleware(apiDeleteCron))

@@ -28,7 +28,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       // 检查卡片是否已存在，避免因页面重载和消息推送导致重复添加
       const existingCard = document.querySelector(`.session-card[data-session-id="${msg.payload.id}"]`);
       if (!existingCard) {
-        add(msg.payload.id, msg.payload.isRunning);
+        add(msg.payload.id, msg.payload.isRunning, msg.payload.isPersistent);
       }
     } else if (msg.type === 'session_removed') {
       const cardToRemove = document.querySelector(`.session-card[data-session-id="${msg.payload.id}"]`);
@@ -68,6 +68,11 @@ window.addEventListener('DOMContentLoaded', async () => {
     await fetchCrons();
   } catch (e) {
     console.error("获取 Cron 列表失败 (可能未登录):", e);
+  }
+  try {
+    await fetchBatchDsls();
+  } catch (e) {
+    console.error("获取批量 DSL 列表失败 (可能未登录):", e);
   }
 
   await restoreSessions(); // 无论上面是否成功，都恢复会话卡片渲染
