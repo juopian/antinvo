@@ -245,7 +245,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan
+	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan
 	URL             string      `json:"url,omitempty"`             // navigate 的参数
 	Selector        string      `json:"selector,omitempty"`        // CSS 选择器
 	Value           string      `json:"value,omitempty"`           // 填入的值
@@ -646,6 +646,9 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr})
 		case "click":
 			expr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+		case "submit":
+			expr := fmt.Sprintf("document.querySelector(`%s`).requestSubmit()", action.Selector)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
 		case "select":
 			// 改造为更稳健的方式，在设置 value 后，同时触发 input 和 change 事件，以兼容各类前端框架
@@ -1155,6 +1158,7 @@ func apiGenerateDSL(w http.ResponseWriter, r *http.Request) {
 - navigate: {"type": "navigate", "url": "网页地址"}
 - input: {"type": "input", "selector": "CSS选择器", "value": "要输入的文本"}
 - click: {"type": "click", "selector": "CSS选择器"}
+- submit: {"type": "submit", "selector": "表单的CSS选择器"}
 - wait: {"type": "wait", "ms": 毫秒数}
 - wait_selector: {"type": "wait_selector", "selector": "CSS选择器", "timeout": 等待超时秒数}
 - keypress: {"type": "keypress", "selector": "CSS选择器", "value": "按键名，如Enter"}
