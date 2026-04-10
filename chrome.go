@@ -53,6 +53,7 @@ func launchChrome(chromePath string, port int, dir string) *exec.Cmd {
 		"--ignore-certificate-errors", // 在某些企业代理环境下，这可能是必需的
 		"--no-first-run",
 		"--no-default-browser-check",
+		"--disable-popup-blocking", // 禁用弹出窗口拦截
 	}
 	if proxyServer := os.Getenv("HTTP_PROXY"); proxyServer != "" {
 		args = append(args, fmt.Sprintf("--proxy-server=%s", proxyServer))

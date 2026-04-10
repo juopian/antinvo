@@ -79,8 +79,9 @@ func setupSessionHandlers(session *Session) {
 		}
 	}
 
-	// 监听帧
+	// 监听帧和其他事件
 	client.onEvent = func(method string, params json.RawMessage) {
+		fmt.Println("Event:", method)
 		if method == "Page.screencastFrame" {
 			var frame struct {
 				Data      string `json:"data"`
@@ -101,8 +102,373 @@ func setupSessionHandlers(session *Session) {
 			}
 			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
 		}
+		if method == "Target.attachedToTarget" {
+			var attachParams struct {
+				SessionID  string `json:"sessionId"`
+				TargetInfo struct {
+					TargetID string `json:"targetId"`
+					Type     string `json:"type"`
+					URL      string `json:"url"`
+				} `json:"targetInfo"`
+			}
+			json.Unmarshal(params, &attachParams)
+
+			if attachParams.TargetInfo.Type == "page" {
+				// 由当前页面触发打开的新页面（例如：window.open 或 target="_blank"）
+				go func(targetID, detachSessionID, url string) {
+					log.Printf("Session %s: 拦截到新弹窗, TargetID: %s", session.ID, targetID)
+
+					// 先解除扁平化挂载，因为我们会建立独立的 WebSocket 连接将其作为一个独立 Session 管理
+					session.Client.Call("Target.detachFromTarget", map[string]interface{}{"sessionId": detachSessionID})
+
+					wsURL, err := getWSURLForTarget(session.Port, targetID)
+					if err != nil {
+						log.Printf("无法获取新弹窗的 wsURL: %v", err)
+						return
+					}
+
+					newClient, err := NewClient(wsURL)
+					if err != nil {
+						log.Printf("无法连接新弹窗: %v", err)
+						return
+					}
+
+					newClient.Call("Page.enable", nil)
+
+					newID := fmt.Sprintf("%s-popup-%d", session.ID, time.Now().UnixNano())
+
+					mu.Lock()
+					newSession := &Session{
+						ID:            newID,
+						Port:          session.Port,
+						ParentClient:  session.Client,
+						TargetID:      targetID,
+						IsPersistent:  session.IsPersistent,
+						Client:        newClient,
+						Cmd:           nil, // 共享父级的浏览器进程
+						UserDataDir:   "",  // 设为空，防止临时会话弹窗关闭时误删父级的数据目录
+						WS:            make(map[*websocket.Conn]bool),
+						broadcast:     make(chan []byte, 256),
+						userInputChan: make(chan string, 1),
+					}
+					sessions[newID] = newSession
+					mu.Unlock()
+
+					go newSession.broadcastLoop()
+					newClient.onClose = func() { deleteSession(newID) }
+					setupSessionHandlers(newSession)
+
+					// 通知前端当前会话的 UI：弹窗已创建，可自行决定是否弹出新画中画或跳转
+					message, _ := json.Marshal(map[string]interface{}{
+						"type": "popup_created",
+						"payload": map[string]string{
+							"parentSessionId": session.ID,
+							"newSessionId":    newID,
+							"url":             url,
+						},
+					})
+					session.broadcast <- message
+
+					// 通知全局：有新会话加入，前端的左侧会话列表会自动多出一个新实例
+					broadcastSessionEvent("session_added", SessionInfo{
+						ID:           newID,
+						IsRunning:    false,
+						IsPersistent: session.IsPersistent,
+					})
+				}(attachParams.TargetInfo.TargetID, attachParams.SessionID, attachParams.TargetInfo.URL)
+			}
+		}
+		if method == "Runtime.bindingCalled" {
+			var bindParams struct {
+				Name    string `json:"name"`
+				Payload string `json:"payload"`
+			}
+			json.Unmarshal(params, &bindParams)
+
+			if bindParams.Name == "parentRelay" {
+				var payloadObj struct {
+					Type string `json:"type"`
+				}
+				json.Unmarshal([]byte(bindParams.Payload), &payloadObj)
+
+				if payloadObj.Type == "close_popup" {
+					log.Printf("Session %s: 父窗口主动请求关闭其生成的弹窗...", session.ID)
+					mu.Lock()
+					for _, child := range sessions {
+						if child.ParentClient == session.Client && child.TargetID != "" {
+							go session.Client.Call("Target.closeTarget", map[string]interface{}{"targetId": child.TargetID})
+						}
+					}
+					mu.Unlock()
+					// ⚠️ 终极修复：不但要拉回前台，还要主动派发 focus 和 visibilitychange 事件
+					// 破解现代 SPA 框架（如 React Query, SWR）因页面未获焦点而导致网络请求/动画无限期挂起的问题
+					go func() {
+						session.Client.Call("Page.bringToFront", nil)
+						session.Client.Call("Runtime.evaluate", map[string]interface{}{
+							"expression": `setTimeout(() => { window.focus(); window.dispatchEvent(new Event('focus')); document.dispatchEvent(new Event('visibilitychange')); }, 100);`,
+						})
+					}()
+				}
+			}
+
+			if bindParams.Name == "ssoRelay" && session.ParentClient != nil {
+				var payloadObj struct {
+					Type         string      `json:"type"`
+					Msg          interface{} `json:"msg"`
+					TargetOrigin string      `json:"targetOrigin"`
+					SourceOrigin string      `json:"sourceOrigin"`
+					URL          string      `json:"url"`
+				}
+				json.Unmarshal([]byte(bindParams.Payload), &payloadObj)
+
+				if payloadObj.Type == "postMessage" {
+					log.Printf("Session %s: 收到弹窗的 SSO 消息，正在虚拟桥接转发给父窗口...", session.ID)
+					msgJSON, _ := json.Marshal(payloadObj.Msg)
+					sourceOrigin := payloadObj.SourceOrigin
+					if sourceOrigin == "" {
+						sourceOrigin = "*"
+					}
+					// ⚠️ 终极修复：在父窗口中派发真实的 MessageEvent，并将 source 设置为真实的 iframe 对象，通过严格的 === 校验！
+					relayExpr := fmt.Sprintf(`
+						window.dispatchEvent(new MessageEvent('message', {
+							data: %s,
+							origin: '%s',
+							source: window.__ssoMockWin || window
+						}));
+					`, string(msgJSON), sourceOrigin)
+					session.ParentClient.Call("Runtime.evaluate", map[string]interface{}{
+						"expression": relayExpr,
+					})
+				} else if payloadObj.Type == "close" {
+					log.Printf("Session %s: SSO 弹窗请求自我关闭，执行强制销毁...", session.ID)
+					go session.ParentClient.Call("Target.closeTarget", map[string]interface{}{"targetId": session.TargetID})
+					// ⚠️ 终极修复：若是弹窗自我关闭，同样必须唤醒并触发焦点事件
+					go func() {
+						session.ParentClient.Call("Page.bringToFront", nil)
+						session.ParentClient.Call("Runtime.evaluate", map[string]interface{}{
+							"expression": `setTimeout(() => { window.focus(); window.dispatchEvent(new Event('focus')); document.dispatchEvent(new Event('visibilitychange')); }, 100);`,
+						})
+					}()
+				} else if payloadObj.Type == "reload" {
+					log.Printf("Session %s: 收到弹窗请求刷新父页面...", session.ID)
+					go session.ParentClient.Call("Page.reload", map[string]interface{}{"ignoreCache": true})
+				} else if payloadObj.Type == "navigate" {
+					log.Printf("Session %s: 收到弹窗请求父页面跳转至 %s...", session.ID, payloadObj.URL)
+					go session.ParentClient.Call("Page.navigate", map[string]interface{}{"url": payloadObj.URL})
+				}
+			}
+		}
+		if method == "Page.windowOpen" {
+			var windowOpenParams struct {
+				URL            string   `json:"url"`
+				WindowName     string   `json:"windowName"`
+				WindowFeatures []string `json:"windowFeatures"`
+				UserGesture    bool     `json:"userGesture"`
+			}
+			json.Unmarshal(params, &windowOpenParams)
+
+			go func(url string) {
+				// 1. ⚠️ 核心修复：解析可能存在的相对路径（应对 window.open('/sso/login') 的情况）
+				if !strings.HasPrefix(url, "http") && url != "" && url != "about:blank" {
+					resolveExpr := fmt.Sprintf("new URL('%s', location.href).href", url)
+					rawUrl, err := session.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": resolveExpr, "returnByValue": true})
+					if err == nil {
+						var res struct {
+							Result struct {
+								Value string `json:"value"`
+							} `json:"result"`
+						}
+						json.Unmarshal(rawUrl, &res)
+						if res.Result.Value != "" {
+							url = res.Result.Value
+						}
+					}
+				}
+
+				if url == "" {
+					url = "about:blank"
+				}
+				log.Printf("Session %s: 拦截到被阻止的 window.open, 强制新建标签页并建立虚拟桥接, URL: %s", session.ID, url)
+
+				// 1. 强制创建新 Target (⚠️ 核心修复：先打开 about:blank 解决时序竞争)
+				newTargetRaw, err := session.Client.Call("Target.createTarget", map[string]interface{}{"url": "about:blank", "newWindow": false})
+				if err != nil {
+					log.Printf("强制创建新标签页失败: %v", err)
+					return
+				}
+
+				var targetRes struct {
+					TargetID string `json:"targetId"`
+				}
+				json.Unmarshal(newTargetRaw, &targetRes)
+				if targetRes.TargetID == "" {
+					return
+				}
+
+				wsURL, err := getWSURLForTarget(session.Port, targetRes.TargetID)
+				if err != nil {
+					return
+				}
+				newClient, err := NewClient(wsURL)
+				if err != nil {
+					return
+				}
+
+				newClient.Call("Page.enable", nil)
+				newClient.Call("Runtime.enable", nil) // 必须启用 Runtime 才能用 binding
+
+				// 🎯 核心黑科技：注入虚拟父窗口桥接 (Virtual Opener Bridge)
+				newClient.Call("Runtime.addBinding", map[string]interface{}{"name": "ssoRelay"})
+				mockOpenerScript := `
+					const mockOpenerHandler = {
+						get: function(target, prop) {
+							if (prop === 'postMessage') {
+								return function(msg, targetOrigin) {
+									if(window.ssoRelay) window.ssoRelay(JSON.stringify({type: 'postMessage', msg: msg, targetOrigin: targetOrigin, sourceOrigin: window.location.origin}));
+								};
+							}
+							if (prop === 'location') {
+								return new Proxy({}, {
+									get: function(locTarget, locProp) {
+										if (locProp === 'reload') {
+											return function() {
+												if(window.ssoRelay) window.ssoRelay(JSON.stringify({type: 'reload'}));
+											};
+										}
+										if (locProp === 'replace' || locProp === 'assign') {
+											return function(url) {
+												if(window.ssoRelay) window.ssoRelay(JSON.stringify({type: 'navigate', url: url}));
+											};
+										}
+										return locTarget[locProp] || '';
+									},
+									set: function(locTarget, locProp, value) {
+										if (locProp === 'href') {
+											if(window.ssoRelay) window.ssoRelay(JSON.stringify({type: 'navigate', url: value}));
+										}
+										locTarget[locProp] = value;
+										return true;
+									}
+								});
+							}
+							if (prop === 'closed') return false;
+							// 防止跨域降域代码报错
+							if (prop === 'document') return { domain: window.location.hostname };
+							return target[prop];
+						},
+						set: function(target, prop, value) {
+							target[prop] = value;
+							return true;
+						}
+					};
+					const mockOpener = new Proxy({}, mockOpenerHandler);
+					Object.defineProperty(window, 'opener', {
+						get: () => mockOpener,
+						set: () => {}
+					});
+					const originalClose = window.close;
+					window.close = function() {
+						if(window.ssoRelay) window.ssoRelay(JSON.stringify({type: 'close'}));
+						if(originalClose) originalClose.apply(window);
+					};
+				`
+				newClient.Call("Page.addScriptToEvaluateOnNewDocument", map[string]interface{}{
+					"source": mockOpenerScript,
+				})
+
+				newID := fmt.Sprintf("%s-popup-%d", session.ID, time.Now().UnixNano())
+
+				mu.Lock()
+				newSession := &Session{
+					ID:            newID,
+					Port:          session.Port,
+					ParentClient:  session.Client, // 记录父 Client，用于转发 postMessage
+					TargetID:      targetRes.TargetID,
+					IsPersistent:  session.IsPersistent,
+					Client:        newClient,
+					Cmd:           nil,
+					UserDataDir:   "",
+					WS:            make(map[*websocket.Conn]bool),
+					broadcast:     make(chan []byte, 256),
+					userInputChan: make(chan string, 1),
+				}
+				sessions[newID] = newSession
+				mu.Unlock()
+
+				go newSession.broadcastLoop()
+				newClient.onClose = func() { deleteSession(newID) }
+				setupSessionHandlers(newSession)
+
+				// 2. ⚠️ 核心修复：把新建的弹窗强制拉到前台！解除无头模式后台休眠节流，让画面动起来，DSL不再超时
+				newClient.Call("Page.bringToFront", nil)
+
+				// 2. ⚠️ 核心修复：等所有拦截器和虚拟桥接注入完毕后，再导航到真实的 SSO 地址！
+				newClient.Call("Page.navigate", map[string]interface{}{"url": url})
+
+				// 🚀 就在这里！直接向前端发送 popup_created 消息！
+				message, _ := json.Marshal(map[string]interface{}{
+					"type": "popup_created",
+					"payload": map[string]string{
+						"parentSessionId": session.ID,
+						"newSessionId":    newID,
+						"url":             url,
+					},
+				})
+				session.broadcast <- message
+
+				broadcastSessionEvent("session_added", SessionInfo{
+					ID:           newID,
+					IsRunning:    false,
+					IsPersistent: session.IsPersistent,
+				})
+			}(windowOpenParams.URL)
+		}
 	}
 	client.Call("Page.startScreencast", map[string]interface{}{"format": "jpeg", "quality": 50})
+	// 开启自动附加，以递归方式捕获该页面弹出的新窗口
+	client.Call("Target.setAutoAttach", map[string]interface{}{
+		"autoAttach":             true,
+		"waitForDebuggerOnStart": false,
+		"flatten":                true,
+	})
+
+	// 注册 parentRelay 并在父窗口劫持 window.open，返回 Mock 对象防止 JS 报错
+	client.Call("Runtime.enable", nil)
+	client.Call("Runtime.addBinding", map[string]interface{}{"name": "parentRelay"})
+	mockOpenScript := `
+		const originalOpen = window.open;
+		window.open = function(url, name, features) {
+			originalOpen.apply(window, arguments); // 依然执行原方法以触发 CDP 拦截
+			
+			let win;
+			try {
+				// 强制返回一个真实的 Window 对象 (iframe.contentWindow) 
+				// 以完美通过父窗口安全代码中的 e.source === win 校验
+				const iframe = document.createElement('iframe');
+				iframe.style.display = 'none';
+				iframe.src = 'about:blank';
+				(document.body || document.documentElement).appendChild(iframe);
+				win = iframe.contentWindow;
+				
+				const origClose = win.close;
+				win.close = function() {
+					if(window.parentRelay) window.parentRelay(JSON.stringify({type: 'close_popup'}));
+					try { if(origClose) origClose.call(win); } catch(e) {}
+					// 延迟移除 iframe，并在此第一时间触发前端焦点恢复，彻底消除 loading 卡死
+					try { 
+						setTimeout(function(){ 
+							iframe.remove(); 
+							window.focus();
+							window.dispatchEvent(new Event('focus'));
+						}, 50); 
+					} catch(e) {}
+				};
+				window.__ssoMockWin = win;
+			} catch(e) {}
+			return win;
+		};
+	`
+	client.Call("Page.addScriptToEvaluateOnNewDocument", map[string]interface{}{"source": mockOpenScript})
 }
 
 func create(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +611,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan
+	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan, with_popup
 	URL             string      `json:"url,omitempty"`             // navigate 的参数
 	Selector        string      `json:"selector,omitempty"`        // CSS 选择器
 	Value           string      `json:"value,omitempty"`           // 填入的值
@@ -634,7 +1000,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				shouldBeChecked := action.Value == "true"
 				if currentlyChecked != shouldBeChecked {
 					clickExpr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
-					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr})
+					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 				}
 			} else {
 				log.Printf("Session %s: checkbox element not found '%s'", s.ID, action.Selector)
@@ -643,13 +1009,13 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			// 这种方式假定选择器能定位到 radio 组 (例如, 'input[name="group"]'),
 			// 然后通过 action.Value 来指定具体要点击的那个选项的 value.
 			clickExpr := fmt.Sprintf("document.querySelector(`%s[value='%s']`).click()", action.Selector, action.Value)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr})
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 		case "click":
 			expr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
 		case "submit":
 			expr := fmt.Sprintf("document.querySelector(`%s`).requestSubmit()", action.Selector)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
 		case "select":
 			// 改造为更稳健的方式，在设置 value 后，同时触发 input 和 change 事件，以兼容各类前端框架
 			expr := fmt.Sprintf(`
@@ -660,7 +1026,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 					select.dispatchEvent(new Event('change', { bubbles: true }));
 				}
 			`, action.Selector, action.Value, action.Value)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr})
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
 		case "keypress":
 			// 1. 如果传入了选择器，敲击前先强制让该元素获取焦点
 			if action.Selector != "" {
@@ -703,7 +1069,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				return
 			}
 		case "eval":
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Script})
+			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Script, "userGesture": true})
 		case "wait_selector":
 			// 轮询等待元素出现（最多等待 10 秒）
 			timeout := 10 * time.Second
@@ -756,64 +1122,82 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				}
 			}
 		case "wait_for_captcha":
-			// 1. 提取图形验证码的 src 或 data URL
-			getCaptchaExpr := fmt.Sprintf(`
-				(() => {
-					const el = document.querySelector('%s');
-					if (!el) return null;
-					if (el.tagName.toLowerCase() === 'img') return el.src;
-					if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
-					return null;
-				})()
-			`, action.CaptchaSelector)
+			// 使用 for 循环支持验证码的原地刷新重试
+			for {
+				// 1. 提取图形验证码的 src 或 data URL
+				getCaptchaExpr := fmt.Sprintf(`
+					(() => {
+						const el = document.querySelector('%s');
+						if (!el) return null;
+						if (el.tagName.toLowerCase() === 'img') return el.src;
+						if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
+						return null;
+					})()
+				`, action.CaptchaSelector)
 
-			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCaptchaExpr, "returnByValue": true})
-			if err != nil {
-				log.Printf("Session %s: 获取图形验证码失败: %v", s.ID, err)
-				return
-			}
+				raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCaptchaExpr, "returnByValue": true})
+				if err != nil {
+					log.Printf("Session %s: 获取图形验证码失败: %v", s.ID, err)
+					return
+				}
 
-			var res struct {
-				Result struct {
-					Value string `json:"value"`
-				} `json:"result"`
-			}
-			json.Unmarshal(raw, &res)
-			captchaData := res.Result.Value
+				var res struct {
+					Result struct {
+						Value string `json:"value"`
+					} `json:"result"`
+				}
+				json.Unmarshal(raw, &res)
+				captchaData := res.Result.Value
 
-			if captchaData == "" {
-				log.Printf("Session %s: 未找到图形验证码元素或元素内容为空 (%s)", s.ID, action.CaptchaSelector)
-				return
-			}
+				if captchaData == "" {
+					log.Printf("Session %s: 未找到图形验证码元素或元素内容为空 (%s)", s.ID, action.CaptchaSelector)
+					return
+				}
 
-			// 2. 将图形验证码和输入框广播到前端
-			prompt := "请输入验证码"
-			if action.Prompt != "" {
-				prompt = action.Prompt
-			}
-			interactionPayload := map[string]interface{}{
-				"type": "user_interaction_required",
-				"payload": map[string]string{
-					"inputType":   "captcha",
-					"captchaData": captchaData,
-					"prompt":      prompt,
-				},
-			}
-			msg, _ := json.Marshal(interactionPayload)
-			s.broadcast <- msg
+				// 2. 将图形验证码和输入框广播到前端
+				prompt := "请输入验证码"
+				if action.Prompt != "" {
+					prompt = action.Prompt
+				}
+				interactionPayload := map[string]interface{}{
+					"type": "user_interaction_required",
+					"payload": map[string]string{
+						"inputType":   "captcha",
+						"captchaData": captchaData,
+						"prompt":      prompt,
+					},
+				}
+				msg, _ := json.Marshal(interactionPayload)
+				s.broadcast <- msg
 
-			// 3. 等待用户输入
-			select {
-			case userInput := <-s.userInputChan:
+				// 3. 等待用户输入
+				var userInput string
+				select {
+				case userInput = <-s.userInputChan:
+				case <-ctx.Done():
+					finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+					s.broadcast <- finishMsg
+					return
+				}
+
+				// 4. 处理内置的刷新验证码指令
+				if userInput == "__REFRESH__" {
+					log.Printf("Session %s: 用户请求刷新图形验证码", s.ID)
+					// 模拟点击网页上的验证码元素，触发网站内置的验证码刷新机制
+					clickExpr := fmt.Sprintf("document.querySelector('%s').click()", action.CaptchaSelector)
+					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
+					// 等待 500ms 让网页有时间去加载新的验证码图片
+					time.Sleep(500 * time.Millisecond)
+					continue // 继续循环，重新提取新验证码并下发
+				}
+
+				// 5. 正常的文本输入，保存变量并结束当前动作
 				if action.VariableName != "" {
 					variables[action.VariableName] = userInput
 				}
 				finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
 				s.broadcast <- finishMsg
-			case <-ctx.Done():
-				finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
-				s.broadcast <- finishMsg
-				return
+				break // 跳出循环，执行下一个 DSL 动作
 			}
 		case "wait_for_qrcode_scan":
 			// 1. 提取二维码的 src 或 data URL
@@ -884,6 +1268,36 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				log.Printf("Session %s: 等待扫码结果时出错: %v", s.ID, err)
 			} else {
 				log.Printf("Session %s: 扫码成功, 找到目标元素.", s.ID)
+			}
+		case "with_popup":
+			var popupSession *Session
+			// 轮询等待弹窗 Session 被创建（最多等待 15 秒）
+			for j := 0; j < 75; j++ {
+				if ctx.Err() != nil {
+					return
+				}
+				mu.Lock()
+				for _, child := range sessions {
+					// 寻找归属于当前父页面的存活弹窗
+					if child.ParentClient == s.Client && child.TargetID != "" {
+						popupSession = child
+						break
+					}
+				}
+				mu.Unlock()
+				if popupSession != nil {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+
+			if popupSession != nil {
+				log.Printf("Session %s: 找到弹窗 Session %s, 开始自动执行弹窗内的 DSL", s.ID, popupSession.ID)
+				// 将执行上下文切换到弹窗的 Session，并递归执行属于弹窗的动作
+				executeDSLActions(ctx, popupSession, action.Then, variables, creatorID)
+				log.Printf("Session %s: 弹窗 DSL 执行完毕，返回主页面继续...", s.ID)
+			} else {
+				log.Printf("Session %s: 执行 with_popup 失败，等待弹窗超时", s.ID)
 			}
 		}
 	}

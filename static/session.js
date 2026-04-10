@@ -374,6 +374,62 @@ function add(id, initIsRunning = false, isPersistent = false) {
       handleInteraction(card, message.payload);
     } else if (message.type === 'user_interaction_finished') {
       handleInteractionEnd(card);
+    } else if (message.type === 'popup_created') {
+      // 收到后端弹窗通知，在当前卡片内动态渲染一个画中画 (Picture-in-Picture) 浮层
+      const popupId = message.payload.newSessionId;
+
+      const popupDiv = document.createElement('div');
+      popupDiv.className = 'popup-overlay';
+      popupDiv.style.cssText = `
+        position: absolute;
+        top: 5%;
+        left: 5%;
+        width: 90%;
+        height: 90%;
+        background: #fff;
+        border-radius: 8px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      `;
+
+      // 弹窗头部标题栏
+      const header = document.createElement('div');
+      header.style.cssText = 'background: #333; color: #fff; padding: 8px 12px; font-size: 12px; display: flex; justify-content: space-between; align-items: center;';
+      header.innerHTML = `<span>🔗 弹出窗口 (SSO)</span>`;
+      
+      // 手动关闭按钮 (应对有些网站不自动调用 window.close 的情况)
+      const closePopupBtn = document.createElement('button');
+      closePopupBtn.innerText = '✖';
+      closePopupBtn.style.cssText = 'background: none; border: none; color: #fff; cursor: pointer; font-size: 14px; line-height: 1;';
+      closePopupBtn.onclick = () => {
+          fetch(`/delete?id=${popupId}`); // 通知后端主动销毁该弹窗进程
+          popupDiv.remove();
+      };
+      header.appendChild(closePopupBtn);
+
+      const popupImg = document.createElement('img');
+      popupImg.style.cssText = 'width: 100%; height: calc(100% - 30px); object-fit: contain; background: #f0f0f0;';
+
+      popupDiv.appendChild(header);
+      popupDiv.appendChild(popupImg);
+      card.appendChild(popupDiv); // 将画中画挂载到当前会话卡片内部
+
+      // 建立对这个新弹窗的独立 WebSocket 监听，拉取它的画面
+      const popupWs = new WebSocket(`ws://${location.host}/ws?sessionId=${popupId}`);
+      popupWs.onmessage = (pMsg) => {
+          const pData = JSON.parse(pMsg.data);
+          if (pData.type === 'screencast') {
+              popupImg.src = "data:image/jpeg;base64," + pData.data;
+          }
+      };
+
+      // 🎯 终极闭环：当弹窗 JS 执行了 window.close() 被后端捕获并销毁时，WebSocket 会自动断开，此时自动清理前端画中画 UI
+      popupWs.onclose = () => {
+          popupDiv.remove();
+      };
     }
   };
 
@@ -403,7 +459,7 @@ function handleInteraction(card, payload) {
     `;
     closeInteractionBtn.onclick = () => {
       interactionPanel.style.display = 'none';
-      if (showInteractionBtn) showInteractionBtn.style.display = 'none'; 
+      if (showInteractionBtn) showInteractionBtn.style.display = 'flex';
     };
 
     const promptText = document.createElement('p');
@@ -434,6 +490,7 @@ function handleInteraction(card, payload) {
     interactionPanel.appendChild(input);
     interactionPanel.appendChild(submitBtn);
     interactionPanel.style.display = 'flex';
+    // if (showInteractionBtn) showInteractionBtn.style.display = 'inline-block';
   } else if (payload.inputType === 'captcha') {
     const showInteractionBtn = card.querySelector('.btn-input');
     const interactionPanel = card.querySelector('.interaction-panel');
@@ -456,7 +513,7 @@ function handleInteraction(card, payload) {
     `;
     closeInteractionBtn.onclick = () => {
       interactionPanel.style.display = 'none';
-      if (showInteractionBtn) showInteractionBtn.style.display = 'none';
+      if (showInteractionBtn) showInteractionBtn.style.display = 'flex';
     };
 
     const captchaImage = document.createElement('img');
@@ -488,13 +545,27 @@ function handleInteraction(card, payload) {
         });
     };
 
+    const refreshBtn = document.createElement('button');
+    refreshBtn.innerText = '🔄 刷新';
+    refreshBtn.style.marginLeft = '10px';
+    refreshBtn.onclick = () => {
+      const sessionId = card.dataset.sessionId;
+      refreshBtn.disabled = true;
+      refreshBtn.innerText = '刷新中...';
+      fetch(`/user_input?id=${sessionId}`, { method: 'POST', body: '__REFRESH__' })
+        .then(res => {
+          if (!res.ok) alert('刷新请求发送失败');
+        });
+    };
+
     interactionPanel.appendChild(closeInteractionBtn);
     interactionPanel.appendChild(captchaImage);
     interactionPanel.appendChild(promptText);
     interactionPanel.appendChild(input);
     interactionPanel.appendChild(submitBtn);
+    interactionPanel.appendChild(refreshBtn);
     interactionPanel.style.display = 'flex';
-    if (showInteractionBtn) showInteractionBtn.style.display = 'flex'; // Ensure the button is visible
+    // if (showInteractionBtn) showInteractionBtn.style.display = 'inline-block'; // Ensure the button is visible
   } else if (payload.inputType === 'qrcode') {
     const showQrCodeBtn = card.querySelector('.btn-qrcode');
     const overlay = card.querySelector('.interaction-overlay');
@@ -527,6 +598,7 @@ function handleInteraction(card, payload) {
     `;
     overlay.prepend(closeOverlayBtn);
     overlay.classList.add('active');
+    // if (showQrCodeBtn) showQrCodeBtn.style.display = 'inline-block';
   }
 }
 
