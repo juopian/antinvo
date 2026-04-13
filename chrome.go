@@ -53,7 +53,14 @@ func launchChrome(chromePath string, port int, dir string) *exec.Cmd {
 		"--ignore-certificate-errors", // 在某些企业代理环境下，这可能是必需的
 		"--no-first-run",
 		"--no-default-browser-check",
-		"--disable-popup-blocking", // 禁用弹出窗口拦截
+		"--disable-popup-blocking",                           // 禁用弹出窗口拦截
+		"--disable-web-security",                             // 禁用同源策略，允许跨域访问 iframe
+		"--disable-site-isolation-trials",                    // 禁用站点隔离
+		"--disable-features=IsolateOrigins,site-per-process", // 彻底允许跨域 iframe 的 DOM 穿透
+		"--disable-background-timer-throttling",              // 禁用后台定时器节流
+		"--disable-backgrounding-occluded-windows",           // 禁用遮挡窗口后台化
+		"--disable-renderer-backgrounding",                   // 彻底禁用渲染器后台运行限制
+		"--disable-ipc-flooding-protection",                  // 禁用 IPC 泛洪保护，防止高频通信被掐断
 	}
 	if proxyServer := os.Getenv("HTTP_PROXY"); proxyServer != "" {
 		args = append(args, fmt.Sprintf("--proxy-server=%s", proxyServer))

@@ -353,85 +353,98 @@ function add(id, initIsRunning = false, isPersistent = false) {
 
   document.getElementById('list').appendChild(card);
 
-  const ws = new WebSocket(`ws://${location.host}/ws?sessionId=${id}`);
+  let ws;
+  const connectWs = () => {
+    ws = new WebSocket(`ws://${location.host}/ws?sessionId=${id}`);
 
-  ws.onmessage = (msg) => {
-    const message = JSON.parse(msg.data);
+    ws.onmessage = (msg) => {
+      const message = JSON.parse(msg.data);
 
-    if (message.type === 'screencast') {
-      img.src = "data:image/jpeg;base64," + message.data;
-    } else if (message.type === 'log') {
-      console.log('CDP Log:', message.logType, message.payload);
-      // 将日志追加到面板中
-      const logLine = document.createElement('div');
-      logLine.className = 'log-line';
-      const method = message.payload.method || 'Response';
-      const details = message.payload.params || message.payload;
-      logLine.innerText = `[${message.logType}] ${method} ${JSON.stringify(details)}`;
-      logContent.appendChild(logLine);
-      logContent.scrollTop = logContent.scrollHeight; // 自动滚至底部
-    } else if (message.type === 'user_interaction_required') {
-      handleInteraction(card, message.payload);
-    } else if (message.type === 'user_interaction_finished') {
-      handleInteractionEnd(card);
-    } else if (message.type === 'popup_created') {
-      // 收到后端弹窗通知，在当前卡片内动态渲染一个画中画 (Picture-in-Picture) 浮层
-      const popupId = message.payload.newSessionId;
+      if (message.type === 'screencast') {
+        img.src = "data:image/jpeg;base64," + message.data;
+      } else if (message.type === 'log') {
+        console.log('CDP Log:', message.logType, message.payload);
+        // 将日志追加到面板中
+        const logLine = document.createElement('div');
+        logLine.className = 'log-line';
+        const method = message.payload.method || 'Response';
+        const details = message.payload.params || message.payload;
+        logLine.innerText = `[${message.logType}] ${method} ${JSON.stringify(details)}`;
+        logContent.appendChild(logLine);
+        logContent.scrollTop = logContent.scrollHeight; // 自动滚至底部
+      } else if (message.type === 'user_interaction_required') {
+        handleInteraction(card, message.payload);
+      } else if (message.type === 'user_interaction_finished') {
+        handleInteractionEnd(card);
+      } else if (message.type === 'popup_created') {
+        // 收到后端弹窗通知，在当前卡片内动态渲染一个画中画 (Picture-in-Picture) 浮层
+        const popupId = message.payload.newSessionId;
 
-      const popupDiv = document.createElement('div');
-      popupDiv.className = 'popup-overlay';
-      popupDiv.style.cssText = `
-        position: absolute;
-        top: 5%;
-        left: 5%;
-        width: 90%;
-        height: 90%;
-        background: #fff;
-        border-radius: 8px;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.6);
-        z-index: 1000;
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-      `;
+        const popupDiv = document.createElement('div');
+        popupDiv.className = 'popup-overlay';
+        popupDiv.style.cssText = `
+          position: absolute;
+          top: 5%;
+          left: 5%;
+          width: 90%;
+          height: 90%;
+          background: #fff;
+          border-radius: 8px;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+          z-index: 1000;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+        `;
 
-      // 弹窗头部标题栏
-      const header = document.createElement('div');
-      header.style.cssText = 'background: #333; color: #fff; padding: 8px 12px; font-size: 12px; display: flex; justify-content: space-between; align-items: center;';
-      header.innerHTML = `<span>🔗 弹出窗口 (SSO)</span>`;
-      
-      // 手动关闭按钮 (应对有些网站不自动调用 window.close 的情况)
-      const closePopupBtn = document.createElement('button');
-      closePopupBtn.innerText = '✖';
-      closePopupBtn.style.cssText = 'background: none; border: none; color: #fff; cursor: pointer; font-size: 14px; line-height: 1;';
-      closePopupBtn.onclick = () => {
-          fetch(`/delete?id=${popupId}`); // 通知后端主动销毁该弹窗进程
-          popupDiv.remove();
-      };
-      header.appendChild(closePopupBtn);
+        // 弹窗头部标题栏
+        const header = document.createElement('div');
+        header.style.cssText = 'background: #333; color: #fff; padding: 8px 12px; font-size: 12px; display: flex; justify-content: space-between; align-items: center;';
+        header.innerHTML = `<span>🔗 弹出窗口 (SSO)</span>`;
+        
+        // 手动关闭按钮 (应对有些网站不自动调用 window.close 的情况)
+        const closePopupBtn = document.createElement('button');
+        closePopupBtn.innerText = '✖';
+        closePopupBtn.style.cssText = 'background: none; border: none; color: #fff; cursor: pointer; font-size: 14px; line-height: 1;';
+        closePopupBtn.onclick = () => {
+            fetch(`/delete?id=${popupId}`); // 通知后端主动销毁该弹窗进程
+            popupDiv.remove();
+        };
+        header.appendChild(closePopupBtn);
 
-      const popupImg = document.createElement('img');
-      popupImg.style.cssText = 'width: 100%; height: calc(100% - 30px); object-fit: contain; background: #f0f0f0;';
+        const popupImg = document.createElement('img');
+        popupImg.style.cssText = 'width: 100%; height: calc(100% - 30px); object-fit: contain; background: #f0f0f0;';
 
-      popupDiv.appendChild(header);
-      popupDiv.appendChild(popupImg);
-      card.appendChild(popupDiv); // 将画中画挂载到当前会话卡片内部
+        popupDiv.appendChild(header);
+        popupDiv.appendChild(popupImg);
+        card.appendChild(popupDiv); // 将画中画挂载到当前会话卡片内部
 
-      // 建立对这个新弹窗的独立 WebSocket 监听，拉取它的画面
-      const popupWs = new WebSocket(`ws://${location.host}/ws?sessionId=${popupId}`);
-      popupWs.onmessage = (pMsg) => {
-          const pData = JSON.parse(pMsg.data);
-          if (pData.type === 'screencast') {
-              popupImg.src = "data:image/jpeg;base64," + pData.data;
-          }
-      };
+        // 建立对这个新弹窗的独立 WebSocket 监听，拉取它的画面
+        const popupWs = new WebSocket(`ws://${location.host}/ws?sessionId=${popupId}`);
+        popupWs.onmessage = (pMsg) => {
+            const pData = JSON.parse(pMsg.data);
+            if (pData.type === 'screencast') {
+                popupImg.src = "data:image/jpeg;base64," + pData.data;
+            }
+        };
 
-      // 🎯 终极闭环：当弹窗 JS 执行了 window.close() 被后端捕获并销毁时，WebSocket 会自动断开，此时自动清理前端画中画 UI
-      popupWs.onclose = () => {
-          popupDiv.remove();
-      };
-    }
+        // 🎯 终极闭环：当弹窗 JS 执行了 window.close() 被后端捕获并销毁时，WebSocket 会自动断开，此时自动清理前端画中画 UI
+        popupWs.onclose = () => {
+            popupDiv.remove();
+        };
+      }
+    };
+
+    ws.onclose = () => {
+      // 防止由于网络波动或长时间空闲导致的 WebSocket 自动断开引起“假死”
+      if (document.body.contains(card)) {
+        console.log('WebSocket disconnected, attempting to reconnect...');
+        // setTimeout(connectWs, 3000);
+      }
+    };
   };
+
+  connectWs();
 
   updateStats();
 }

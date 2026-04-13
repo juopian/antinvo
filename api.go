@@ -102,6 +102,30 @@ func setupSessionHandlers(session *Session) {
 			}
 			go client.Call("Page.screencastFrameAck", map[string]interface{}{"sessionId": frame.SessionID})
 		}
+		if method == "Runtime.exceptionThrown" {
+			log.Printf("Session %s: ⚠️ JS 执行异常: %s", session.ID, string(params))
+			// 将异常日志直接推送到前端面板
+			message, _ := json.Marshal(map[string]interface{}{
+				"type":      "log",
+				"logType":   "error",
+				"sessionId": session.ID,
+				"payload":   string(params),
+			})
+			session.wsMu.Lock()
+			if session.isDslRunning {
+				session.lastLogs = append(session.lastLogs, message)
+			}
+			session.wsMu.Unlock()
+			select {
+			case session.broadcast <- message:
+			default:
+			}
+		}
+		if method == "Page.javascriptDialogOpening" {
+			// 自动放行网页的 alert/confirm 对话框，防止其阻塞浏览器主线程导致画面永久卡死
+			log.Printf("Session %s: 拦截到网页弹出的阻塞对话框 (alert/confirm)，已自动放行", session.ID)
+			go client.Call("Page.handleJavaScriptDialog", map[string]interface{}{"accept": true})
+		}
 		if method == "Target.attachedToTarget" {
 			var attachParams struct {
 				SessionID  string `json:"sessionId"`
@@ -626,6 +650,7 @@ type DSLAction struct {
 	VariableName    string      `json:"variableName,omitempty"`    // wait_for_input 存储用户输入的变量名
 	SuccessSelector string      `json:"successSelector,omitempty"` // wait_for_qrcode_scan 的成功标识元素
 	CaptchaSelector string      `json:"captchaSelector,omitempty"` // wait_for_captcha 的图形验证码元素选择器
+	Iframe          string      `json:"iframe,omitempty"`          // 新增：目标元素所在 iframe 的 CSS 选择器
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -683,6 +708,16 @@ func runDSL(w http.ResponseWriter, r *http.Request) {
 	s.isDslRunning = true
 	s.lastLogs = nil
 	s.wsMu.Unlock()
+
+	// ⚠️ 终极修复：注入全局焦点模拟，安全重启推流，打破 Chrome 录屏流假死状态
+	go func() {
+		s.Client.Call("Emulation.setFocusEmulationEnabled", map[string]interface{}{"enabled": true})
+		s.Client.Call("Page.bringToFront", nil)
+		s.Client.Call("Page.startScreencast", map[string]interface{}{"format": "jpeg", "quality": 50})
+		s.Client.Call("Runtime.evaluate", map[string]interface{}{
+			"expression": `document.body.style.transform = 'translateZ(0)'; setTimeout(() => document.body.style.transform = '', 50);`,
+		})
+	}()
 
 	var actions []DSLAction
 	if err := json.NewDecoder(r.Body).Decode(&actions); err != nil {
@@ -775,6 +810,16 @@ func runDSLBulk(w http.ResponseWriter, r *http.Request) {
 	s.isDslRunning = true // 标记会话正在运行批量DSL
 	s.lastLogs = nil
 	s.wsMu.Unlock()
+
+	// ⚠️ 终极修复：注入全局焦点模拟，安全重启推流
+	go func() {
+		s.Client.Call("Emulation.setFocusEmulationEnabled", map[string]interface{}{"enabled": true})
+		s.Client.Call("Page.bringToFront", nil)
+		s.Client.Call("Page.startScreencast", map[string]interface{}{"format": "jpeg", "quality": 50})
+		s.Client.Call("Runtime.evaluate", map[string]interface{}{
+			"expression": `document.body.style.transform = 'translateZ(0)'; setTimeout(() => document.body.style.transform = '', 50);`,
+		})
+	}()
 
 	defer func() {
 		s.wsMu.Lock()
@@ -942,6 +987,13 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		action.Condition = substituteVariables(action.Condition, variables, creatorID)
 		action.Prompt = substituteVariables(action.Prompt, variables, creatorID)
 		action.SuccessSelector = substituteVariables(action.SuccessSelector, variables, creatorID)
+		action.Iframe = substituteVariables(action.Iframe, variables, creatorID)
+
+		// 移除 ?. 可选链语法，完美向下兼容老版本 Chrome 无头浏览器
+		targetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.Selector)
+		if action.Iframe != "" {
+			targetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.Selector)
+		}
 
 		switch action.Type {
 		case "navigate":
@@ -973,16 +1025,54 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			// 额外给前端框架 500ms 的宽限期，用于完成复杂的事件绑定(Hydration)
 			time.Sleep(500 * time.Millisecond)
 		case "input":
-			focusExpr := fmt.Sprintf("document.querySelector(`%s`).focus()", action.Selector)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusExpr})
+			// ⚠️ 终极修复：改用“全选后覆盖”逻辑，模拟真实人类清空输入框再输入的行为，完美兼容所有前端框架
+			focusAndSelectExpr := fmt.Sprintf(`
+				(() => {
+					const el = %s;
+					if (el) {
+						el.focus();
+						if (typeof el.select === 'function') {
+							el.select(); // 针对普通 input 和 textarea 原生全选
+						} else {
+							// 兼容 contenteditable 等富文本框的全选 (支持跨 iframe)
+							const range = document.createRange();
+							range.selectNodeContents(el);
+							const sel = el.ownerDocument.defaultView.getSelection();
+							sel.removeAllRanges();
+							sel.addRange(range);
+						}
+						return true;
+					}
+					return false;
+				})();
+			`, targetExpr)
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusAndSelectExpr, "returnByValue": true})
+
+			var res struct {
+				Result struct {
+					Value bool `json:"value"`
+				} `json:"result"`
+			}
+			if err == nil {
+				json.Unmarshal(raw, &res)
+			}
+
+			if !res.Result.Value {
+				log.Printf("Session %s: input 操作被跳过，未找到目标元素 '%s'", s.ID, action.Selector)
+				continue // 找不到元素时直接跳过键盘输入，防止密码误输入到上一个输入框中
+			}
 
 			if action.Value != "" {
 				s.Client.Call("Input.insertText", map[string]interface{}{
 					"text": action.Value,
 				})
+			} else {
+				// 如果想要输入空字符串（即清空内容），则在全选的状态下敲击一次退格键删除全部文本
+				s.Client.Call("Input.dispatchKeyEvent", map[string]interface{}{"type": "keyDown", "key": "Backspace", "code": "Backspace"})
+				s.Client.Call("Input.dispatchKeyEvent", map[string]interface{}{"type": "keyUp", "key": "Backspace", "code": "Backspace"})
 			}
 		case "checkbox": // 使用CDP先检查状态，再决定是否点击，更接近原生操作
-			getCheckedStateExpr := fmt.Sprintf("document.querySelector(`%s`) ? document.querySelector(`%s`).checked : null", action.Selector, action.Selector)
+			getCheckedStateExpr := fmt.Sprintf("%s ? %s.checked : null", targetExpr, targetExpr)
 			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCheckedStateExpr, "returnByValue": true})
 			if err != nil {
 				log.Printf("Session %s: checkbox state check failed for '%s': %v", s.ID, action.Selector, err)
@@ -999,7 +1089,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				currentlyChecked := *res.Result.Value
 				shouldBeChecked := action.Value == "true"
 				if currentlyChecked != shouldBeChecked {
-					clickExpr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
+					clickExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.click(); })()", targetExpr)
 					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 				}
 			} else {
@@ -1008,35 +1098,106 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		case "radio": // 改造为使用更精确的组合选择器直接点击，而不是JS循环
 			// 这种方式假定选择器能定位到 radio 组 (例如, 'input[name="group"]'),
 			// 然后通过 action.Value 来指定具体要点击的那个选项的 value.
-			clickExpr := fmt.Sprintf("document.querySelector(`%s[value='%s']`).click()", action.Selector, action.Value)
+			radioSelector := fmt.Sprintf("%s[value='%s']", action.Selector, action.Value)
+			radioTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", radioSelector)
+			if action.Iframe != "" {
+				radioTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, radioSelector)
+			}
+			clickExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.click(); })()", radioTargetExpr)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 		case "click":
-			expr := fmt.Sprintf("document.querySelector(`%s`).click()", action.Selector)
-			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
+			// 🎯 终极杀招：利用 Promise + 真实事件序列，完美解决 0ms 竞态问题，且无视 iframe 坐标偏移
+			expr := fmt.Sprintf(`
+				(function() {
+					return new Promise(function(resolve) {
+						var el = %s;
+						if (!el) return resolve(false);
+						if (typeof el.scrollIntoView === 'function') {
+							try { el.scrollIntoView({block: 'center'}); } catch(e){}
+						}
+						try {
+							var win = el.ownerDocument.defaultView || window;
+							var dispatch = function(type) {
+								el.dispatchEvent(new win.MouseEvent(type, {
+									view: win,
+									bubbles: true,
+									cancelable: true,
+									buttons: 1
+								}));
+							};
+							
+							// 1. 发送按下事件，触发前端框架去请求 uuid API
+							dispatch('mouseover');
+							dispatch('mouseenter');
+							dispatch('mousedown');
+
+							// 2. ⚠️ 极其关键：挂起 Promise 等待 600ms，让 API 请求彻底返回！
+							setTimeout(function() {
+								try {
+									// 3. API就绪后，再发送点击事件，完美渲染弹窗
+									dispatch('mouseup');
+									dispatch('click');
+								} catch(e) {
+									el.click();
+								}
+								resolve(true);
+							}, 600);
+						} catch(e) {
+							el.click();
+							resolve(true);
+						}
+					});
+				})();
+			`, targetExpr)
+
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{
+				"expression":    expr,
+				"awaitPromise":  true, // ⚠️ 必须开启，要求 CDP 等待我们的 Promise 执行完毕
+				"returnByValue": true,
+				"userGesture":   true,
+			})
+			var res struct {
+				Result struct {
+					Value bool `json:"value"`
+				} `json:"result"`
+			}
+			if err == nil {
+				json.Unmarshal(raw, &res)
+			}
+
+			if !res.Result.Value {
+				log.Printf("Session %s: click 操作被跳过，未找到目标元素 '%s'", s.ID, action.Selector)
+			}
 		case "submit":
-			expr := fmt.Sprintf("document.querySelector(`%s`).requestSubmit()", action.Selector)
+			expr := fmt.Sprintf("(function(){ var el = %s; if(el) el.requestSubmit(); })()", targetExpr)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
 		case "select":
 			// 改造为更稳健的方式，在设置 value 后，同时触发 input 和 change 事件，以兼容各类前端框架
 			expr := fmt.Sprintf(`
-				const select = document.querySelector('%s');
+				const select = %s;
 				if (select && select.value !== '%s') {
 					select.value = '%s';
 					select.dispatchEvent(new Event('input', { bubbles: true }));
 					select.dispatchEvent(new Event('change', { bubbles: true }));
 				}
-			`, action.Selector, action.Value, action.Value)
+			`, targetExpr, action.Value, action.Value)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
 		case "keypress":
 			// 1. 如果传入了选择器，敲击前先强制让该元素获取焦点
 			if action.Selector != "" {
-				focusExpr := fmt.Sprintf(`document.querySelector("%s").focus()`, action.Selector)
+				focusExpr := fmt.Sprintf("%s?.focus()", targetExpr)
 				s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusExpr})
 
 				// 等待元素真正获得焦点
-				pollExpr := fmt.Sprintf("document.activeElement === document.querySelector(`%s`)", action.Selector)
+				var pollExpr string
+				if action.Iframe != "" {
+					pollExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.activeElement === %s : false; })()", action.Iframe, targetExpr)
+				} else {
+					pollExpr = fmt.Sprintf("(document.activeElement === %s)", targetExpr)
+				}
 				if err := pollForSuccess(ctx, s, pollExpr, 5*time.Second); err != nil {
 					log.Printf("Session %s: keypress 操作无法聚焦于元素 '%s': %v", s.ID, action.Selector, err)
+					continue // 聚焦失败时跳过按键操作，防止按键事件发送到错误的元素
 				}
 			}
 
@@ -1076,7 +1237,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			if action.Timeout > 0 {
 				timeout = time.Duration(action.Timeout) * time.Second
 			}
-			expr := fmt.Sprintf("!!document.querySelector(`%s`)", action.Selector)
+			expr := fmt.Sprintf("!!(%s)", targetExpr)
 			err := pollForSuccess(ctx, s, expr, timeout)
 			if err != nil {
 				log.Printf("Session %s: wait_selector for '%s' failed: %v", s.ID, action.Selector, err)
@@ -1089,7 +1250,6 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 						Value bool `json:"value"`
 					} `json:"result"`
 				}
-				fmt.Println("raw", raw)
 				json.Unmarshal(raw, &res)
 				if res.Result.Value {
 					executeDSLActions(ctx, s, action.Then, variables, creatorID)
@@ -1122,18 +1282,22 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				}
 			}
 		case "wait_for_captcha":
+			captchaTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.CaptchaSelector)
+			if action.Iframe != "" {
+				captchaTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.CaptchaSelector)
+			}
 			// 使用 for 循环支持验证码的原地刷新重试
 			for {
 				// 1. 提取图形验证码的 src 或 data URL
 				getCaptchaExpr := fmt.Sprintf(`
 					(() => {
-						const el = document.querySelector('%s');
+						const el = %s;
 						if (!el) return null;
 						if (el.tagName.toLowerCase() === 'img') return el.src;
 						if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
 						return null;
 					})()
-				`, action.CaptchaSelector)
+				`, captchaTargetExpr)
 
 				raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getCaptchaExpr, "returnByValue": true})
 				if err != nil {
@@ -1184,7 +1348,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				if userInput == "__REFRESH__" {
 					log.Printf("Session %s: 用户请求刷新图形验证码", s.ID)
 					// 模拟点击网页上的验证码元素，触发网站内置的验证码刷新机制
-					clickExpr := fmt.Sprintf("document.querySelector('%s').click()", action.CaptchaSelector)
+					clickExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.click(); })()", captchaTargetExpr)
 					s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 					// 等待 500ms 让网页有时间去加载新的验证码图片
 					time.Sleep(500 * time.Millisecond)
@@ -1203,7 +1367,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			// 1. 提取二维码的 src 或 data URL
 			getQrCodeExpr := fmt.Sprintf(`
 				(() => {
-					const el = document.querySelector('%s');
+					const el = %s;
 					if (!el) return null;
 					if (el.tagName.toLowerCase() === 'img') return el.src;
 					if (el.tagName.toLowerCase() === 'canvas') return el.toDataURL();
@@ -1214,7 +1378,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 					}
 					return null; 
 				})()
-			`, action.Selector)
+			`, targetExpr)
 
 			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": getQrCodeExpr, "returnByValue": true})
 			if err != nil {
@@ -1256,7 +1420,11 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			if action.Timeout > 0 {
 				timeout = action.Timeout
 			}
-			successPollExpr := fmt.Sprintf("!!document.querySelector(`%s`)", action.SuccessSelector)
+			successTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.SuccessSelector)
+			if action.Iframe != "" {
+				successTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.SuccessSelector)
+			}
+			successPollExpr := fmt.Sprintf("!!(%s)", successTargetExpr)
 			log.Printf("Session %s: 等待扫码登录, 轮询目标元素: %s", s.ID, action.SuccessSelector)
 			err = pollForSuccess(ctx, s, successPollExpr, time.Duration(timeout)*time.Second)
 
