@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -125,6 +126,54 @@ func setupSessionHandlers(session *Session) {
 			// 自动放行网页的 alert/confirm 对话框，防止其阻塞浏览器主线程导致画面永久卡死
 			log.Printf("Session %s: 拦截到网页弹出的阻塞对话框 (alert/confirm)，已自动放行", session.ID)
 			go client.Call("Page.handleJavaScriptDialog", map[string]interface{}{"accept": true})
+		}
+		if method == "Fetch.requestPaused" {
+			var pausedParams struct {
+				RequestId string `json:"requestId"`
+				Request   struct {
+					Url     string            `json:"url"`
+					Headers map[string]string `json:"headers"`
+				} `json:"request"`
+			}
+			json.Unmarshal(params, &pausedParams)
+
+			go func(reqId string, reqUrl string, headers map[string]string) {
+				if headers == nil {
+					headers = make(map[string]string)
+				}
+
+				hasOrigin := false
+				originKey := "Origin"
+				for k, v := range headers {
+					if strings.ToLower(k) == "origin" {
+						hasOrigin = true
+						originKey = k
+						if v == "null" || v == "" {
+							hasOrigin = false // 强制覆盖无效的 Origin
+						}
+						break
+					}
+				}
+
+				// 🎯 核心修复：如果由于无头模式/跨域导致 Origin 丢失或为 null，智能伪造回它请求自身的域名
+				if !hasOrigin {
+					parsedURL, err := url.Parse(reqUrl)
+					if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" {
+						headers[originKey] = parsedURL.Scheme + "://" + parsedURL.Host
+					}
+				}
+
+				var cdpHeaders []map[string]string
+				for k, v := range headers {
+					cdpHeaders = append(cdpHeaders, map[string]string{"name": k, "value": v})
+				}
+
+				// 携带修复后的 headers 继续放行请求
+				session.Client.Call("Fetch.continueRequest", map[string]interface{}{
+					"requestId": reqId,
+					"headers":   cdpHeaders,
+				})
+			}(pausedParams.RequestId, pausedParams.Request.Url, pausedParams.Request.Headers)
 		}
 		if method == "Target.attachedToTarget" {
 			var attachParams struct {
@@ -493,6 +542,13 @@ func setupSessionHandlers(session *Session) {
 		};
 	`
 	client.Call("Page.addScriptToEvaluateOnNewDocument", map[string]interface{}{"source": mockOpenScript})
+
+	client.Call("Fetch.enable", map[string]interface{}{
+		"patterns": []map[string]interface{}{
+			{"requestStage": "Request", "resourceType": "XHR"},
+			{"requestStage": "Request", "resourceType": "Fetch"},
+		},
+	})
 }
 
 func create(w http.ResponseWriter, r *http.Request) {
@@ -1106,14 +1162,15 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			clickExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.click(); })()", radioTargetExpr)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 		case "click":
-			// 🎯 终极杀招：利用 Promise + 真实事件序列，完美解决 0ms 竞态问题，且无视 iframe 坐标偏移
+			// 🎯 终极归位：既然 Fetch 拦截器已经解决了 API 的 403 Origin 拦截问题
+			// 我们回归最精准的 DOM 级 Promise + 真实事件序列，彻底避免物理坐标在跨域 Iframe 中计算偏移造成的误触！
 			expr := fmt.Sprintf(`
 				(function() {
 					return new Promise(function(resolve) {
 						var el = %s;
 						if (!el) return resolve(false);
 						if (typeof el.scrollIntoView === 'function') {
-							try { el.scrollIntoView({block: 'center'}); } catch(e){}
+							try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e){}
 						}
 						try {
 							var win = el.ownerDocument.defaultView || window;
@@ -1569,7 +1626,7 @@ func listSessions(w http.ResponseWriter, r *http.Request) {
 // --- DSL Management CRUD ---
 func apiListDSL(w http.ResponseWriter, r *http.Request) {
 	userInfo := r.Context().Value(UserInfoKey{}).(UserInfo)
-	rows, err := db.Query("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM dsl_scripts WHERE creator_id = ? ORDER BY id DESC", userInfo.OaID)
+	rows, err := db.Query("SELECT id, name, content, creator_id, strftime('%Y-%m-%d %H:%M:%S', created_at) FROM dsl_scripts WHERE creator_id = ? ORDER BY name", userInfo.OaID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

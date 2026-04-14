@@ -56,8 +56,8 @@ func (c *Client) Call(method string, params interface{}) (json.RawMessage, error
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++
-	// 存储请求的 ID 和对应的方法
-	c.pending[id] = pendingRequest{ch: make(chan map[string]json.RawMessage, 1), method: method}
+	reqCh := make(chan map[string]json.RawMessage, 1)
+	c.pending[id] = pendingRequest{ch: reqCh, method: method}
 	c.mu.Unlock()
 
 	if c.onCall != nil && method != "Page.screencastFrameAck" {
@@ -68,16 +68,22 @@ func (c *Client) Call(method string, params interface{}) (json.RawMessage, error
 	err := c.conn.WriteJSON(CDPRequest{ID: id, Method: method, Params: params})
 	c.writeMu.Unlock()
 	if err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, err
 	}
 
 	select {
-	case resp := <-c.pending[id].ch: // 从通道读取响应
+	case resp := <-reqCh: // ⚠️ 核心修复：直接从局部变量通道读取响应，彻底避免并发时的无锁 map 访问崩溃
 		if errRaw, ok := resp["error"]; ok {
 			return nil, fmt.Errorf("CDP error: %s", string(errRaw))
 		}
 		return resp["result"], nil
 	case <-time.After(30 * time.Second):
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, fmt.Errorf("timeout: %s", method)
 	}
 }

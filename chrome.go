@@ -61,6 +61,7 @@ func launchChrome(chromePath string, port int, dir string) *exec.Cmd {
 		"--disable-backgrounding-occluded-windows",           // 禁用遮挡窗口后台化
 		"--disable-renderer-backgrounding",                   // 彻底禁用渲染器后台运行限制
 		"--disable-ipc-flooding-protection",                  // 禁用 IPC 泛洪保护，防止高频通信被掐断
+		"--disable-blink-features=AutomationControlled",      // 隐藏 navigator.webdriver 标志，防止 API 接口被反爬拦截
 	}
 	if proxyServer := os.Getenv("HTTP_PROXY"); proxyServer != "" {
 		args = append(args, fmt.Sprintf("--proxy-server=%s", proxyServer))
