@@ -691,7 +691,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, eval, keypress, wait_for_input, wait_for_qrcode_scan, with_popup
+	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, wait_selector_hidden, eval, keypress, wait_for_input, wait_for_qrcode_scan, with_popup
 	URL             string      `json:"url,omitempty"`             // navigate 的参数
 	Selector        string      `json:"selector,omitempty"`        // CSS 选择器
 	Value           string      `json:"value,omitempty"`           // 填入的值
@@ -707,6 +707,7 @@ type DSLAction struct {
 	SuccessSelector string      `json:"successSelector,omitempty"` // wait_for_qrcode_scan 的成功标识元素
 	CaptchaSelector string      `json:"captchaSelector,omitempty"` // wait_for_captcha 的图形验证码元素选择器
 	Iframe          string      `json:"iframe,omitempty"`          // 新增：目标元素所在 iframe 的 CSS 选择器
+	ShadowRoot      string      `json:"shadowRoot,omitempty"`      // 新增：目标元素所在 shadow DOM 宿主元素的 CSS 选择器
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -1044,12 +1045,21 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		action.Prompt = substituteVariables(action.Prompt, variables, creatorID)
 		action.SuccessSelector = substituteVariables(action.SuccessSelector, variables, creatorID)
 		action.Iframe = substituteVariables(action.Iframe, variables, creatorID)
+		action.ShadowRoot = substituteVariables(action.ShadowRoot, variables, creatorID)
 
-		// 移除 ?. 可选链语法，完美向下兼容老版本 Chrome 无头浏览器
-		targetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.Selector)
-		if action.Iframe != "" {
-			targetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.Selector)
+		// 构建通用的目标元素获取 JS 表达式，完美兼容老版本 Chrome，并支持跨域 Iframe 及 Shadow DOM 穿透
+		buildTargetExpr := func(iframe, shadow, selector string) string {
+			if iframe != "" && shadow != "" {
+				return fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); var doc = ifr && ifr.contentDocument ? ifr.contentDocument : null; if (!doc) return null; var host = doc.querySelector(`%s`); return host && host.shadowRoot ? host.shadowRoot.querySelector(`%s`) : null; })()", iframe, shadow, selector)
+			} else if iframe != "" {
+				return fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", iframe, selector)
+			} else if shadow != "" {
+				return fmt.Sprintf("(function(){ var host = document.querySelector(`%s`); return host && host.shadowRoot ? host.shadowRoot.querySelector(`%s`) : null; })()", shadow, selector)
+			}
+			return fmt.Sprintf("document.querySelector(`%s`)", selector)
 		}
+
+		targetExpr := buildTargetExpr(action.Iframe, action.ShadowRoot, action.Selector)
 
 		switch action.Type {
 		case "navigate":
@@ -1155,10 +1165,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			// 这种方式假定选择器能定位到 radio 组 (例如, 'input[name="group"]'),
 			// 然后通过 action.Value 来指定具体要点击的那个选项的 value.
 			radioSelector := fmt.Sprintf("%s[value='%s']", action.Selector, action.Value)
-			radioTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", radioSelector)
-			if action.Iframe != "" {
-				radioTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, radioSelector)
-			}
+			radioTargetExpr := buildTargetExpr(action.Iframe, action.ShadowRoot, radioSelector)
 			clickExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.click(); })()", radioTargetExpr)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": clickExpr, "userGesture": true})
 		case "click":
@@ -1242,16 +1249,11 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		case "keypress":
 			// 1. 如果传入了选择器，敲击前先强制让该元素获取焦点
 			if action.Selector != "" {
-				focusExpr := fmt.Sprintf("%s?.focus()", targetExpr)
+				focusExpr := fmt.Sprintf("(function(){ var el = %s; if(el) el.focus(); })()", targetExpr)
 				s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": focusExpr})
 
 				// 等待元素真正获得焦点
-				var pollExpr string
-				if action.Iframe != "" {
-					pollExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.activeElement === %s : false; })()", action.Iframe, targetExpr)
-				} else {
-					pollExpr = fmt.Sprintf("(document.activeElement === %s)", targetExpr)
-				}
+				pollExpr := fmt.Sprintf("(function(){ var target = %s; return target && (document.activeElement === target || (target.getRootNode && target.getRootNode().activeElement === target)); })()", targetExpr)
 				if err := pollForSuccess(ctx, s, pollExpr, 5*time.Second); err != nil {
 					log.Printf("Session %s: keypress 操作无法聚焦于元素 '%s': %v", s.ID, action.Selector, err)
 					continue // 聚焦失败时跳过按键操作，防止按键事件发送到错误的元素
@@ -1299,6 +1301,26 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			if err != nil {
 				log.Printf("Session %s: wait_selector for '%s' failed: %v", s.ID, action.Selector, err)
 			}
+		case "wait_selector_hidden":
+			// 轮询等待元素隐藏或消失（最多等待 10 秒）
+			timeout := 10 * time.Second
+			if action.Timeout > 0 {
+				timeout = time.Duration(action.Timeout) * time.Second
+			}
+			expr := fmt.Sprintf(`
+				(function() {
+					var el = %s;
+					if (!el) return true; // 如果元素不存在于 DOM 中，视为已隐藏
+					var win = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window;
+					var style = win.getComputedStyle(el);
+					// 综合判断隐藏状态：display 为 none，或 visibility 为 hidden，或透明度为 0，或宽高为 0
+					return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || (el.offsetWidth === 0 && el.offsetHeight === 0);
+				})()
+			`, targetExpr)
+			err := pollForSuccess(ctx, s, expr, timeout)
+			if err != nil {
+				log.Printf("Session %s: wait_selector_hidden for '%s' failed: %v", s.ID, action.Selector, err)
+			}
 		case "if":
 			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Condition})
 			if err == nil {
@@ -1339,10 +1361,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				}
 			}
 		case "wait_for_captcha":
-			captchaTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.CaptchaSelector)
-			if action.Iframe != "" {
-				captchaTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.CaptchaSelector)
-			}
+			captchaTargetExpr := buildTargetExpr(action.Iframe, action.ShadowRoot, action.CaptchaSelector)
 			// 使用 for 循环支持验证码的原地刷新重试
 			for {
 				// 1. 提取图形验证码的 src 或 data URL
@@ -1477,10 +1496,7 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			if action.Timeout > 0 {
 				timeout = action.Timeout
 			}
-			successTargetExpr := fmt.Sprintf("document.querySelector(`%s`)", action.SuccessSelector)
-			if action.Iframe != "" {
-				successTargetExpr = fmt.Sprintf("(function(){ var ifr = document.querySelector(`%s`); return ifr && ifr.contentDocument ? ifr.contentDocument.querySelector(`%s`) : null; })()", action.Iframe, action.SuccessSelector)
-			}
+			successTargetExpr := buildTargetExpr(action.Iframe, action.ShadowRoot, action.SuccessSelector)
 			successPollExpr := fmt.Sprintf("!!(%s)", successTargetExpr)
 			log.Printf("Session %s: 等待扫码登录, 轮询目标元素: %s", s.ID, action.SuccessSelector)
 			err = pollForSuccess(ctx, s, successPollExpr, time.Duration(timeout)*time.Second)
