@@ -39,12 +39,16 @@ function add(id, initIsRunning = false, isPersistent = false) {
   // 1. 创建遮罩层
   const overlay = document.createElement('div');
   overlay.className = 'overlay';
+  // 优化：让遮罩层不捕获鼠标事件，从而避免 hover 效果遮挡画面，但其子元素可单独捕获
+  overlay.style.pointerEvents = 'none';
 
   const execBtn = document.createElement('button');
   execBtn.className = 'btn-exec';
   execBtn.innerText = '▶ 执行';
   let isRunning = false;
   execBtn.disabled = false; // 初始化时启用按钮
+  // 优化：让按钮可以捕获鼠标事件
+  execBtn.style.pointerEvents = 'auto';
 
   const actionsDiv = document.createElement('div');
   actionsDiv.className = 'card-actions';
@@ -53,6 +57,8 @@ function add(id, initIsRunning = false, isPersistent = false) {
   logBtn.className = 'icon-btn btn-log';
   logBtn.innerHTML = '📜';
   logBtn.title = '查看日志';
+  // 优化：让按钮组可以捕获鼠标事件
+  actionsDiv.style.pointerEvents = 'auto';
 
   const editBtn = document.createElement('button');
   editBtn.className = 'icon-btn btn-edit';
@@ -66,6 +72,7 @@ function add(id, initIsRunning = false, isPersistent = false) {
   showQrCodeBtn.style.display = 'none'; // 默认隐藏
   showQrCodeBtn.onclick = () => {
     card.querySelector('.interaction-overlay').classList.add('active');
+    card.classList.add('interacting');
   };
   const showInteractionBtn = document.createElement('button');
   showInteractionBtn.className = 'icon-btn btn-input';
@@ -74,6 +81,7 @@ function add(id, initIsRunning = false, isPersistent = false) {
   showInteractionBtn.style.display = 'none'; // 默认隐藏
   showInteractionBtn.onclick = () => {
     card.querySelector('.interaction-panel').style.display = 'flex';
+    card.classList.add('interacting');
   };
 
   const closeBtn = document.createElement('button');
@@ -293,6 +301,7 @@ function add(id, initIsRunning = false, isPersistent = false) {
       interactionPanel.style.display = 'none';
       interactionPanel.innerHTML = '';
     }
+    card.classList.remove('interacting');
     updateStats();
   };
 
@@ -450,6 +459,8 @@ function add(id, initIsRunning = false, isPersistent = false) {
 }
 
 function handleInteraction(card, payload) {
+  card.classList.add('interacting');
+
   if (payload.inputType === 'prompt') {
     const showInteractionBtn = card.querySelector('.btn-input');
     const interactionPanel = card.querySelector('.interaction-panel');
@@ -473,6 +484,7 @@ function handleInteraction(card, payload) {
     closeInteractionBtn.onclick = () => {
       interactionPanel.style.display = 'none';
       if (showInteractionBtn) showInteractionBtn.style.display = 'flex';
+      card.classList.remove('interacting');
     };
 
     const promptText = document.createElement('p');
@@ -527,6 +539,7 @@ function handleInteraction(card, payload) {
     closeInteractionBtn.onclick = () => {
       interactionPanel.style.display = 'none';
       if (showInteractionBtn) showInteractionBtn.style.display = 'flex';
+      card.classList.remove('interacting');
     };
 
     const captchaImage = document.createElement('img');
@@ -603,6 +616,7 @@ function handleInteraction(card, payload) {
     closeOverlayBtn.onclick = () => {
       overlay.classList.remove('active');
       if (showQrCodeBtn) showQrCodeBtn.style.display = 'flex'; // 显示重新打开的按钮
+      card.classList.remove('interacting');
     };
 
     overlay.innerHTML = `
@@ -612,10 +626,110 @@ function handleInteraction(card, payload) {
     overlay.prepend(closeOverlayBtn);
     overlay.classList.add('active');
     // if (showQrCodeBtn) showQrCodeBtn.style.display = 'inline-block';
+  } else if (payload.inputType === 'interactive_drag') {
+    const showInteractionBtn = card.querySelector('.btn-input');
+    const interactionPanel = card.querySelector('.interaction-panel');
+    interactionPanel.innerHTML = '';
+
+    // 优化1 & 2: 让整个遮罩层的背景更加透明，且将交互面板位置推到底部
+    interactionPanel.style.backgroundColor = 'rgba(0, 0, 0, 0.15)';
+    interactionPanel.style.justifyContent = 'flex-end';
+    interactionPanel.style.paddingBottom = '25px';
+
+    const controlBox = document.createElement('div');
+    controlBox.style.cssText = 'background: rgba(0, 0, 0, 0.75); padding: 15px 20px; border-radius: 8px; width: 90%; margin: 0 auto; box-sizing: border-box; text-align: center; position: relative; box-shadow: 0 4px 15px rgba(0,0,0,0.3);';
+
+    const closeInteractionBtn = document.createElement('button');
+    closeInteractionBtn.innerHTML = '✖';
+    closeInteractionBtn.title = '关闭交互面板';
+    closeInteractionBtn.style.cssText = `
+        position: absolute; top: 8px; right: 8px; background: none; border: none;
+        color: #ccc; font-size: 16px; cursor: pointer; padding: 2px; line-height: 1;
+    `;
+    closeInteractionBtn.onclick = () => {
+      interactionPanel.style.display = 'none';
+      if (showInteractionBtn) showInteractionBtn.style.display = 'flex';
+      card.classList.remove('interacting');
+    };
+    closeInteractionBtn.onmouseover = () => closeInteractionBtn.style.color = 'white';
+    closeInteractionBtn.onmouseout = () => closeInteractionBtn.style.color = '#ccc';
+
+    const promptText = document.createElement('p');
+    promptText.innerText = payload.prompt || "请拖动拉杆对准图片";
+    promptText.style.color = '#fff';
+    promptText.style.margin = '0 0 10px 0';
+    promptText.style.fontSize = '14px';
+
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '500'; // 绝大多数滑块的最大像素宽带在500以内
+    slider.value = '0';
+    slider.style.cssText = 'width: 100%; margin: 10px 0; cursor: grab; height: 6px; accent-color: #007bff;';
+
+    let lastSendTime = 0;
+    // 利用 40ms 的节流机制，保障实时画面更新体验且不会阻塞 WebSocket 和后端
+    slider.addEventListener('input', (e) => {
+      const now = Date.now();
+      if (now - lastSendTime > 40) {
+        lastSendTime = now;
+        fetch(`/user_input?id=${card.dataset.sessionId}`, { method: 'POST', body: e.target.value });
+      }
+    });
+    slider.addEventListener('change', (e) => {
+      // 发送最后一次精确位置后，自动触发松开（释放鼠标）验证逻辑
+      fetch(`/user_input?id=${card.dataset.sessionId}`, { method: 'POST', body: e.target.value }).then(() => {
+        fetch(`/user_input?id=${card.dataset.sessionId}`, { method: 'POST', body: '__RELEASE__' });
+        slider.disabled = true; // 松开后禁止拖动
+        releaseBtn.style.display = 'none';
+        finishBtn.style.display = 'inline-block';
+        retryBtn.style.display = 'inline-block';
+      });
+    });
+
+    const btnGroup = document.createElement('div');
+    btnGroup.style.cssText = 'display: flex; gap: 10px; justify-content: center; margin-top: 15px;';
+
+    // 自动提交优化：去除了手动点击松开，将原按钮转为只读的提示标签
+    const releaseBtn = document.createElement('button');
+    releaseBtn.innerText = '👆 拖动上方拉杆，对准后直接松开';
+    releaseBtn.disabled = true; // 仅作为提示标签，不可点击
+    releaseBtn.style.cssText = 'background-color: #6c757d; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: default;';
+
+    const finishBtn = document.createElement('button');
+    finishBtn.innerText = '✅ 验证成功 (继续)';
+    finishBtn.style.cssText = 'background-color: #28a745; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; display: none;';
+
+    const retryBtn = document.createElement('button');
+    retryBtn.innerText = '🔄 验证失败 (重试)';
+    retryBtn.style.cssText = 'background-color: #ffc107; color: black; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; display: none;';
+
+    finishBtn.onclick = () => fetch(`/user_input?id=${card.dataset.sessionId}`, { method: 'POST', body: '__FINISH__' });
+    
+    retryBtn.onclick = () => {
+      retryBtn.disabled = true;
+      retryBtn.innerText = '准备重试...';
+      fetch(`/user_input?id=${card.dataset.sessionId}`, { method: 'POST', body: '__RETRY__' });
+    };
+
+    btnGroup.appendChild(releaseBtn);
+    btnGroup.appendChild(finishBtn);
+    btnGroup.appendChild(retryBtn);
+
+    controlBox.appendChild(closeInteractionBtn);
+    controlBox.appendChild(promptText);
+    controlBox.appendChild(slider);
+    controlBox.appendChild(btnGroup);
+
+    interactionPanel.appendChild(controlBox);
+    interactionPanel.style.display = 'flex';
+    // if (showInteractionBtn) showInteractionBtn.style.display = 'inline-block';
   }
 }
 
 function handleInteractionEnd(card) {
+  card.classList.remove('interacting');
+
   const showQrCodeBtn = card.querySelector('.btn-qrcode');
   if (showQrCodeBtn) showQrCodeBtn.style.display = 'none'; // 结束时隐藏二维码按钮
   const showInteractionBtn = card.querySelector('.btn-input');
@@ -625,6 +739,10 @@ function handleInteractionEnd(card) {
   if (interactionPanel) {
     interactionPanel.style.display = 'none';
     interactionPanel.innerHTML = '';
+    // 恢复 interactionPanel 的默认样式，防止污染其它类型的交互面板
+    interactionPanel.style.backgroundColor = '';
+    interactionPanel.style.justifyContent = '';
+    interactionPanel.style.paddingBottom = '';
   }
   const overlay = card.querySelector('.interaction-overlay');
   if (overlay) {

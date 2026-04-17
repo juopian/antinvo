@@ -3,3 +3,4 @@ antinvo.db
 .profiles/
 persistent_data/
 secret
+*.exe

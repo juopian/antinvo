@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -691,7 +692,7 @@ func create(w http.ResponseWriter, r *http.Request) {
 
 // DSLAction 定义了单个自动化操作的结构
 type DSLAction struct {
-	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, wait_selector_hidden, eval, keypress, wait_for_input, wait_for_qrcode_scan, with_popup
+	Type            string      `json:"type"`                      // 操作类型: navigate, input, click, select, checkbox, radio, submit, wait, wait_selector, wait_selector_hidden, wait_condition, wait_video_ended, eval, keypress, wait_for_input, wait_for_qrcode_scan, with_popup, drag, interactive_drag, loop
 	URL             string      `json:"url,omitempty"`             // navigate 的参数
 	Selector        string      `json:"selector,omitempty"`        // CSS 选择器
 	Value           string      `json:"value,omitempty"`           // 填入的值
@@ -708,6 +709,10 @@ type DSLAction struct {
 	CaptchaSelector string      `json:"captchaSelector,omitempty"` // wait_for_captcha 的图形验证码元素选择器
 	Iframe          string      `json:"iframe,omitempty"`          // 新增：目标元素所在 iframe 的 CSS 选择器
 	ShadowRoot      string      `json:"shadowRoot,omitempty"`      // 新增：目标元素所在 shadow DOM 宿主元素的 CSS 选择器
+	XOffset         int         `json:"xOffset,omitempty"`         // drag 操作：水平拖动距离(像素)
+	YOffset         int         `json:"yOffset,omitempty"`         // drag 操作：垂直拖动距离(像素)
+	Duration        int         `json:"duration,omitempty"`        // drag 操作：拖动持续时间(毫秒)
+	Count           int         `json:"count,omitempty"`           // loop 操作：明确的循环次数
 }
 
 func runDSL(w http.ResponseWriter, r *http.Request) {
@@ -1235,6 +1240,201 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 		case "submit":
 			expr := fmt.Sprintf("(function(){ var el = %s; if(el) el.requestSubmit(); })()", targetExpr)
 			s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": expr, "userGesture": true})
+		case "drag":
+			// 🎯 降维打击：计算元素的物理绝对坐标，并模拟人类拖拽轨迹突破反作弊滑块
+			coordExpr := fmt.Sprintf(`
+				(function() {
+					var el = %s;
+					if (!el) return null;
+					if (typeof el.scrollIntoView === 'function') {
+						try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e){}
+					}
+					var rect = el.getBoundingClientRect();
+					var x = rect.left + rect.width / 2;
+					var y = rect.top + rect.height / 2;
+					
+					var win = el.ownerDocument.defaultView;
+					while (win && win !== window.top) {
+						try {
+							var frame = win.frameElement;
+							if (frame) {
+								var frameRect = frame.getBoundingClientRect();
+								var style = win.parent.getComputedStyle(frame);
+								x += frameRect.left + parseInt(style.borderLeftWidth || 0);
+								y += frameRect.top + parseInt(style.borderTopWidth || 0);
+							}
+						} catch(e) { break; }
+						win = win.parent;
+					}
+					return {x: Math.round(x), y: Math.round(y)};
+				})();
+			`, targetExpr)
+
+			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": coordExpr, "returnByValue": true})
+			var res struct {
+				Result struct {
+					Subtype string `json:"subtype"`
+					Value   *struct {
+						X int `json:"x"`
+						Y int `json:"y"`
+					} `json:"value"`
+				} `json:"result"`
+			}
+			if err == nil {
+				json.Unmarshal(raw, &res)
+			}
+
+			if res.Result.Subtype != "null" && res.Result.Value != nil {
+				startX, startY := res.Result.Value.X, res.Result.Value.Y
+				endX := startX + action.XOffset
+				endY := startY + action.YOffset
+				duration := action.Duration
+				if duration <= 0 {
+					duration = 1000 // 默认拖拽持续 1 秒
+				}
+
+				// 1. 移动鼠标到目标滑块上方
+				s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseMoved", "x": startX, "y": startY})
+				time.Sleep(150 * time.Millisecond) // 悬停确认
+
+				// 2. 物理按下左键
+				s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mousePressed", "x": startX, "y": startY, "button": "left", "clickCount": 1})
+				time.Sleep(200 * time.Millisecond) // 按下后的反应时间
+
+				// 3. 生成拟人化轨迹 (Ease-Out 缓动算法：先快后慢)
+				steps := duration / 16 // 按 60FPS 计算分片帧数
+				if steps < 10 {
+					steps = 10
+				}
+
+				for i := 1; i <= steps; i++ {
+					t := float64(i) / float64(steps)
+					easeT := 1.0 - (1.0-t)*(1.0-t) // 二次贝塞尔曲线缓出
+
+					curX := startX + int(float64(action.XOffset)*easeT)
+					curY := startY + int(float64(action.YOffset)*easeT)
+
+					// 发送拖动途中的鼠标坐标
+					s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseMoved", "x": curX, "y": curY, "button": "left"})
+					time.Sleep(time.Duration(duration/steps) * time.Millisecond)
+				}
+
+				// 4. 到达终点后，停留片刻 (模拟人类手指松开前的微调)
+				time.Sleep(250 * time.Millisecond)
+
+				// 5. 物理松开左键
+				s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseReleased", "x": endX, "y": endY, "button": "left", "clickCount": 1})
+
+				// 6. 拖拽完成，留出充足时间让网页去向后端发送验证请求
+				time.Sleep(500 * time.Millisecond)
+			} else {
+				log.Printf("Session %s: drag 操作被跳过，未找到目标元素 '%s'", s.ID, action.Selector)
+			}
+		case "interactive_drag":
+			// 🎯 人机协同降维打击：支持原地无限次重试，直到人肉确认滑块破解成功
+			for {
+				coordExpr := fmt.Sprintf(`
+					(function() {
+						var el = %s;
+						if (!el) return null;
+						if (typeof el.scrollIntoView === 'function') {
+							try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e){}
+						}
+						var rect = el.getBoundingClientRect();
+						var x = rect.left + rect.width / 2;
+						var y = rect.top + rect.height / 2;
+						var win = el.ownerDocument.defaultView;
+						while (win && win !== window.top) {
+							try {
+								var frame = win.frameElement;
+								if (frame) {
+									var frameRect = frame.getBoundingClientRect();
+									var style = win.parent.getComputedStyle(frame);
+									x += frameRect.left + parseInt(style.borderLeftWidth || 0);
+									y += frameRect.top + parseInt(style.borderTopWidth || 0);
+								}
+							} catch(e) { break; }
+							win = win.parent;
+						}
+						return {x: Math.round(x), y: Math.round(y)};
+					})();
+				`, targetExpr)
+
+				raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": coordExpr, "returnByValue": true})
+				var res struct {
+					Result struct {
+						Subtype string `json:"subtype"`
+						Value   *struct {
+							X int `json:"x"`
+							Y int `json:"y"`
+						} `json:"value"`
+					} `json:"result"`
+				}
+				if err == nil {
+					json.Unmarshal(raw, &res)
+				}
+
+				if res.Result.Subtype != "null" && res.Result.Value != nil {
+					startX, startY := res.Result.Value.X, res.Result.Value.Y
+					s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseMoved", "x": startX, "y": startY})
+					time.Sleep(150 * time.Millisecond)
+					s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mousePressed", "x": startX, "y": startY, "button": "left", "clickCount": 1})
+
+					prompt := "请拖动拉杆对准图片"
+					if action.Prompt != "" {
+						prompt = action.Prompt
+					}
+					interactionPayload := map[string]interface{}{"type": "user_interaction_required", "payload": map[string]string{"inputType": "interactive_drag", "prompt": prompt}}
+					msg, _ := json.Marshal(interactionPayload)
+					s.broadcast <- msg
+
+					lastOffset := 0
+					interactionDone := false
+					retryRequested := false
+					for {
+						select {
+						case userInput := <-s.userInputChan:
+							if userInput == "__RELEASE__" {
+								s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseReleased", "x": startX + lastOffset, "y": startY, "button": "left", "clickCount": 1})
+							} else if userInput == "__FINISH__" || userInput == "__CANCEL__" {
+								// 兜底再次释放，确保不会变成拖拽锁定，并放行 DSL 继续往下走
+								s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseReleased", "x": startX + lastOffset, "y": startY, "button": "left", "clickCount": 1})
+								finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+								s.broadcast <- finishMsg
+								interactionDone = true
+								break
+							} else if userInput == "__RETRY__" {
+								log.Printf("Session %s: 用户请求重试交互滑块", s.ID)
+								// 兜底释放当前动作
+								s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseReleased", "x": startX + lastOffset, "y": startY, "button": "left", "clickCount": 1})
+								time.Sleep(500 * time.Millisecond) // 等待网页可能在进行的自动重新加载验证码流程
+								retryRequested = true
+								break // 跳出内层事件循环，返回外层 for 循环重新查找元素和定位按下！
+							} else if offset, err := strconv.Atoi(userInput); err == nil {
+								lastOffset = offset
+								s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseMoved", "x": startX + offset, "y": startY, "button": "left"})
+							}
+						case <-ctx.Done():
+							s.Client.Call("Input.dispatchMouseEvent", map[string]interface{}{"type": "mouseReleased", "x": startX + lastOffset, "y": startY, "button": "left", "clickCount": 1})
+							finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+							s.broadcast <- finishMsg
+							return
+						}
+						if interactionDone || retryRequested {
+							break // ⚠️ 核心修复：在这里才能真正跳出内层 for 循环！
+						}
+					}
+					if interactionDone {
+						break // 彻底完成当前 action
+					}
+				} else {
+					log.Printf("Session %s: interactive_drag 操作被跳过，未找到目标元素 '%s'", s.ID, action.Selector)
+					// ⚠️ 兜底修复：如果重试时没找到元素，主动通知前端结束交互，防止面板永久残留
+					finishMsg, _ := json.Marshal(map[string]interface{}{"type": "user_interaction_finished"})
+					s.broadcast <- finishMsg
+					break // 找不到目标直接跳出外层 for 防止无限死循环
+				}
+			}
 		case "select":
 			// 改造为更稳健的方式，在设置 value 后，同时触发 input 和 change 事件，以兼容各类前端框架
 			expr := fmt.Sprintf(`
@@ -1320,6 +1520,32 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 			err := pollForSuccess(ctx, s, expr, timeout)
 			if err != nil {
 				log.Printf("Session %s: wait_selector_hidden for '%s' failed: %v", s.ID, action.Selector, err)
+			}
+		case "wait_condition":
+			timeout := 60 * time.Second
+			if action.Timeout > 0 {
+				timeout = time.Duration(action.Timeout) * time.Second
+			}
+			// 直接执行传入的 JS 表达式，返回 true 则通过
+			err := pollForSuccess(ctx, s, action.Condition, timeout)
+			if err != nil {
+				log.Printf("Session %s: wait_condition failed: %v", s.ID, err)
+			}
+		case "wait_video_ended":
+			// 视频播放通常较长，默认 1 小时超时
+			timeout := 3600 * time.Second
+			if action.Timeout > 0 {
+				timeout = time.Duration(action.Timeout) * time.Second
+			}
+			expr := fmt.Sprintf(`
+				(function() {
+					var el = %s;
+					return el ? (el.ended === true) : false;
+				})()
+			`, targetExpr)
+			err := pollForSuccess(ctx, s, expr, timeout)
+			if err != nil {
+				log.Printf("Session %s: wait_video_ended for '%s' failed: %v", s.ID, action.Selector, err)
 			}
 		case "if":
 			raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": action.Condition})
@@ -1539,6 +1765,54 @@ func executeDSLActions(ctx context.Context, s *Session, actions []DSLAction, var
 				log.Printf("Session %s: 弹窗 DSL 执行完毕，返回主页面继续...", s.ID)
 			} else {
 				log.Printf("Session %s: 执行 with_popup 失败，等待弹窗超时", s.ID)
+			}
+		case "loop":
+			count := action.Count
+			if action.Selector != "" {
+				countExpr := fmt.Sprintf(`
+					(function(){
+						var iframe = "%s", shadow = "%s", selector = "%s";
+						var root = document;
+						if (iframe !== "") {
+							var ifr = document.querySelector(iframe);
+							if (!ifr || !ifr.contentDocument) return 0;
+							root = ifr.contentDocument;
+						}
+						if (shadow !== "") {
+							var host = root.querySelector(shadow);
+							if (!host || !host.shadowRoot) return 0;
+							root = host.shadowRoot;
+						}
+						return root.querySelectorAll(selector).length;
+					})()
+				`, action.Iframe, action.ShadowRoot, action.Selector)
+
+				raw, err := s.Client.Call("Runtime.evaluate", map[string]interface{}{"expression": countExpr, "returnByValue": true})
+				if err == nil {
+					var res struct {
+						Result struct {
+							Value int `json:"value"`
+						} `json:"result"`
+					}
+					json.Unmarshal(raw, &res)
+					count = res.Result.Value
+				}
+			}
+
+			log.Printf("Session %s: loop 开始，准备循环 %d 次", s.ID, count)
+			for i := 0; i < count; i++ {
+				if ctx.Err() != nil {
+					return
+				}
+				loopVars := make(map[string]string)
+				for k, v := range variables {
+					loopVars[k] = v
+				}
+				// 注入循环变量
+				loopVars["loop_index"] = strconv.Itoa(i)       // 0-based
+				loopVars["loop_index_1"] = strconv.Itoa(i + 1) // 1-based (给 css nth-child 使用)
+
+				executeDSLActions(ctx, s, action.Then, loopVars, creatorID)
 			}
 		}
 	}
